@@ -328,7 +328,8 @@ class LongitudinalMpc:
     lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
     return lead_xv
 
-  def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard, experimental_mode=False):
+  def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard, experimental_mode=False,
+             cruise_max_accel=CRUISE_MAX_ACCEL):
     t_follow = get_T_FOLLOW(personality)
     v_ego = self.x0[1]
     self.status = radarstate.leadOne.status or radarstate.leadTwo.status
@@ -356,7 +357,10 @@ class LongitudinalMpc:
     # when the leads are no factor.
     v_lower = v_ego + (T_IDXS * CRUISE_MIN_ACCEL * 1.05)
     # TODO does this make sense when max_a is negative?
-    v_upper = v_ego + (T_IDXS * CRUISE_MAX_ACCEL * 1.05)
+    # Let the profile-specific launch budget reach the cruise obstacle too;
+    # otherwise its fixed 1.6 m/s² ramp would defeat the higher launch ceiling.
+    # Solver/actuator bounds and the planner's turn/jerk limits remain unchanged.
+    v_upper = v_ego + (T_IDXS * cruise_max_accel * 1.05)
     v_cruise_clipped = np.clip(v_cruise * np.ones(N+1), v_lower, v_upper)
     cruise_obstacle = np.cumsum(T_DIFFS * v_cruise_clipped) + get_safe_obstacle_distance(v_cruise_clipped, t_follow)
 

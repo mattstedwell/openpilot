@@ -9,13 +9,14 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource, CRUISE_MAX_ACCEL
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
+from openpilot.sunnypilot.selfdrive.car.chill_aggressive import ChillAggressiveLaunch
 
 A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
@@ -41,8 +42,9 @@ E2E_GREEN_FUTURE_STOP_X = 2.0
 _A_TOTAL_MAX_V = [1.7, 3.2]
 _A_TOTAL_MAX_BP = [20., 40.]
 
-def get_max_accel(v_ego):
-  return np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
+def get_max_accel(v_ego, chill_aggressive_launch=False):
+  stock = np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
+  return stock + (ChillAggressiveLaunch.accel_extra(v_ego) if chill_aggressive_launch else 0.)
 
 def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
@@ -75,6 +77,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.prev_accel_clip = [ACCEL_MIN, ACCEL_MAX]
     self.output_a_target = 0.0
     self.output_should_stop = False
+    self.chill_aggressive_launch = ChillAggressiveLaunch()
     self._from_standstill = False
     self._armed_for_green = False
     self._red_wait_elapsed = 0.0
@@ -247,7 +250,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # No change cost when user is controlling the speed, or when standstill
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
 
-    accel_clip = [ACCEL_MIN, get_max_accel(v_ego)]
+    launch_boost = self.chill_aggressive_launch.update(
+      sm['carControl'].enabled, sm['selfdriveState'].experimentalMode, sm['selfdriveState'].personality,
+      v_ego, v_cruise if v_cruise_initialized else 0., sm['carState'].brakePressed)
+    accel_clip = [ACCEL_MIN, get_max_accel(v_ego, launch_boost)]
     steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['liveParameters'].angleOffsetDeg
     accel_clip = limit_accel_in_turns(v_ego, steer_angle_without_offset, accel_clip, self.CP)
 
@@ -276,7 +282,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
     self.mpc.update(sm['radarState'], v_cruise, personality=sm['selfdriveState'].personality,
-                    experimental_mode=sm['selfdriveState'].experimentalMode)
+                    experimental_mode=sm['selfdriveState'].experimentalMode,
+                    cruise_max_accel=max(CRUISE_MAX_ACCEL, accel_clip[1]) if launch_boost else CRUISE_MAX_ACCEL)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
