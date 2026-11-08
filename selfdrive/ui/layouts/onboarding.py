@@ -177,7 +177,9 @@ class OnboardingWindow(Widget):
   def __init__(self):
     super().__init__()
     self._accepted_terms: bool = ui_state.params.get("HasAcceptedTerms") == terms_version
-    self._training_done: bool = ui_state.params.get("CompletedTrainingVersion") == training_version
+    # Skip the first-start training tutorial; terms and sunnylink consent are unchanged.
+    self._training_done: bool = True
+    ui_state.params.put("CompletedTrainingVersion", training_version)
 
     self._state = OnboardingState.TERMS if not self._accepted_terms else OnboardingState.ONBOARDING
 
