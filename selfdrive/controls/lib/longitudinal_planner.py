@@ -28,6 +28,15 @@ E2E_INTERSECTION_STOP_EXTRA = 15 * 0.3048  # 15 feet
 E2E_PLANNED_STOP_V = 0.5  # m/s
 E2E_LEAD_STOP_MARGIN = 5.0  # m
 
+# After a confirmed green, use chill/MPC accel instead of the model's timid launch.
+E2E_GREEN_PATH_X = 30.0
+E2E_LAUNCH_BRAKE_YIELD = -0.3
+# Require a real stop-then-go (green) before launching from a light.
+E2E_GREEN_ARM_S = 0.6
+E2E_GREEN_CONFIRM_S = 0.1
+E2E_GREEN_STOP_X = 50.0
+E2E_GREEN_FUTURE_STOP_X = 2.0
+
 # Lookup table for turns
 _A_TOTAL_MAX_V = [1.7, 3.2]
 _A_TOTAL_MAX_BP = [20., 40.]
@@ -66,6 +75,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.prev_accel_clip = [ACCEL_MIN, ACCEL_MAX]
     self.output_a_target = 0.0
     self.output_should_stop = False
+    self._from_standstill = False
+    self._armed_for_green = False
+    self._red_wait_elapsed = 0.0
+    self._green_confirm_elapsed = 0.0
+    self._green_confirmed = False
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
     self.a_desired_trajectory = np.zeros(CONTROL_N)
@@ -137,6 +151,77 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     v_shifted = float(np.interp(extra, x_seg, v_seg))
     return min(float(a_e2e), a_shifted), bool(should_stop_e2e) or (v_shifted < 0.3)
+
+  def _reset_green_wait(self):
+    self._armed_for_green = False
+    self._red_wait_elapsed = 0.0
+    self._green_confirm_elapsed = 0.0
+    self._green_confirmed = False
+
+  @staticmethod
+  def _nearby_intersection_stop(sm):
+    # True when the model still plans to stop for a light or sign, not a lead.
+    model = sm['modelV2']
+    if len(model.position.x) < 2 or len(model.velocity.x) < 2:
+      return False
+    x = np.asarray(model.position.x, dtype=float)
+    v = np.asarray(model.velocity.x, dtype=float)
+    n = min(len(x), len(v))
+    x = x[:n]
+    v = v[:n]
+    future_stop = (x > E2E_GREEN_FUTURE_STOP_X) & (v < E2E_PLANNED_STOP_V)
+    if not np.any(future_stop):
+      return False
+    x_stop = float(x[int(np.flatnonzero(future_stop)[0])])
+    if x_stop >= E2E_GREEN_STOP_X:
+      return False
+    lead = sm['radarState'].leadOne
+    if lead.status and float(lead.dRel) < x_stop + E2E_LEAD_STOP_MARGIN:
+      return False
+    return True
+
+  def _update_e2e_chill_launch(self, sm, v_ego, v_cruise, output_a_target_e2e, output_should_stop_mpc, reset_state):
+    # Launch from a light only after the model has been holding a stop and
+    # then clearly releases it (the closest we have to a green-light signal).
+    # An open-looking path alone is not enough, because the model can see
+    # through an intersection while the light is still red.
+    if reset_state:
+      self._from_standstill = False
+      self._reset_green_wait()
+      return False
+
+    if sm['carState'].standstill:
+      if not self._from_standstill:
+        self._reset_green_wait()
+      self._from_standstill = True
+    elif v_cruise > 0 and v_ego >= max(v_cruise - 1.0, 0.0):
+      self._from_standstill = False
+      self._reset_green_wait()
+
+    model_x = sm['modelV2'].position.x
+    path_open = len(model_x) > 0 and float(model_x[-1]) > E2E_GREEN_PATH_X
+    should_stop_e2e = bool(sm['modelV2'].action.shouldStop)
+    nearby_stop = self._nearby_intersection_stop(sm)
+    standstill = bool(sm['carState'].standstill)
+    waiting_on_light = should_stop_e2e or nearby_stop
+
+    if standstill and waiting_on_light:
+      self._red_wait_elapsed += self.dt
+      if self._red_wait_elapsed >= E2E_GREEN_ARM_S:
+        self._armed_for_green = True
+      self._green_confirm_elapsed = 0.0
+    elif standstill and self._armed_for_green and path_open and (not waiting_on_light) and (not output_should_stop_mpc):
+      self._green_confirm_elapsed += self.dt
+      if self._green_confirm_elapsed >= E2E_GREEN_CONFIRM_S:
+        self._green_confirmed = True
+    elif standstill:
+      self._green_confirm_elapsed = 0.0
+
+    return bool(self._from_standstill and
+                self._green_confirmed and
+                not output_should_stop_mpc and
+                not should_stop_e2e and
+                output_a_target_e2e >= E2E_LAUNCH_BRAKE_YIELD)
 
   def update(self, sm):
     LongitudinalPlannerSP.update(self, sm)
@@ -212,7 +297,13 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
-    if self.is_e2e(sm):
+    use_chill_launch = self._update_e2e_chill_launch(sm, v_ego, v_cruise, output_a_target_e2e,
+                                                     output_should_stop_mpc, reset_state)
+    if self.is_e2e(sm) and use_chill_launch:
+      # Confirmed green after a stop: use chill/MPC accel up to set speed.
+      output_a_target = output_a_target_mpc
+      self.output_should_stop = output_should_stop_mpc
+    elif self.is_e2e(sm):
       output_a_target_e2e, output_should_stop_e2e = self._adjust_e2e_intersection_stop(
         sm, v_ego, output_a_target_e2e, output_should_stop_e2e)
       output_a_target = min(output_a_target_e2e, output_a_target_mpc)
