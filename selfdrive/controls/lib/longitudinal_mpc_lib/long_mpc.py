@@ -83,15 +83,15 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
     raise NotImplementedError("Longitudinal personality not supported")
 
 
-def get_lead_stop_extra(personality=log.LongitudinalPersonality.standard):
-  # Extra standstill gap behind a lead: Relaxed (highway) keeps more space,
-  # Aggressive (stop-and-go) stays close so we move when they move.
+def get_lead_stop_extra(personality=log.LongitudinalPersonality.standard, experimental_mode=False):
+  # Only Chill adds the extra five feet for Aggressive. Other personalities
+  # retain their existing gap in both modes; moving T_FOLLOW is unchanged.
   if personality==log.LongitudinalPersonality.relaxed:
     return 10 * 0.3048
   elif personality==log.LongitudinalPersonality.standard:
     return 5 * 0.3048
   elif personality==log.LongitudinalPersonality.aggressive:
-    return 0.0
+    return 0.0 if experimental_mode else 5 * 0.3048
   else:
     raise NotImplementedError("Longitudinal personality not supported")
 
@@ -328,7 +328,7 @@ class LongitudinalMpc:
     lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
     return lead_xv
 
-  def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard):
+  def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard, experimental_mode=False):
     t_follow = get_T_FOLLOW(personality)
     v_ego = self.x0[1]
     self.status = radarstate.leadOne.status or radarstate.leadTwo.status
@@ -344,7 +344,7 @@ class LongitudinalMpc:
     # Extra space when stopping behind a lead, based on personality.
     # Full extra if the lead is stopped so we plan that gap on the approach;
     # blend out as the lead speeds up so moving highway follow is unchanged.
-    lead_stop_extra = get_lead_stop_extra(personality)
+    lead_stop_extra = get_lead_stop_extra(personality, experimental_mode)
     if radarstate.leadOne.status:
       extra_0 = float(np.interp(lead_xv_0[0, 1], [LEAD_STOP_V_FULL, LEAD_STOP_V_NONE], [lead_stop_extra, 0.0]))
       lead_0_obstacle = lead_0_obstacle - extra_0
