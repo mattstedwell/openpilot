@@ -23,6 +23,11 @@ CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 
+# Hold back this far from the e2e model's planned stop for lights/signs.
+E2E_INTERSECTION_STOP_EXTRA = 15 * 0.3048  # 15 feet
+E2E_PLANNED_STOP_V = 0.5  # m/s
+E2E_LEAD_STOP_MARGIN = 5.0  # m
+
 # Lookup table for turns
 _A_TOTAL_MAX_V = [1.7, 3.2]
 _A_TOTAL_MAX_BP = [20., 40.]
@@ -85,6 +90,53 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     else:
       throttle_prob = 1.0
     return x, v, a, j, throttle_prob
+
+  @staticmethod
+  def _adjust_e2e_intersection_stop(sm, v_ego, a_e2e, should_stop_e2e):
+    # Stop 15 ft earlier than the e2e plan at lights and stop signs, and hold
+    # there so the car does not creep up to the original stop line.
+    model = sm['modelV2']
+    extra = E2E_INTERSECTION_STOP_EXTRA
+    if len(model.position.x) < 2 or len(model.velocity.x) < 2:
+      return a_e2e, should_stop_e2e
+
+    x = np.asarray(model.position.x, dtype=float)
+    v = np.asarray(model.velocity.x, dtype=float)
+    n = min(len(x), len(v))
+    x = x[:n]
+    v = v[:n]
+
+    stop_idxs = np.flatnonzero(v < E2E_PLANNED_STOP_V)
+    if stop_idxs.size == 0:
+      return a_e2e, should_stop_e2e
+
+    i_stop = int(stop_idxs[0])
+    x_stop = float(x[i_stop])
+
+    lead = sm['radarState'].leadOne
+    if lead.status and float(lead.dRel) < x_stop + E2E_LEAD_STOP_MARGIN:
+      return a_e2e, should_stop_e2e
+
+    target_x = x_stop - extra
+    v_ego = max(float(v_ego), 0.0)
+
+    if target_x <= 0.8:
+      if v_ego > 0.15:
+        a_hold = -(v_ego * v_ego) / (2.0 * max(target_x, 0.4))
+      else:
+        a_hold = min(float(a_e2e), 0.0)
+      return min(float(a_e2e), a_hold), True
+
+    x_seg = np.maximum.accumulate(x[:i_stop + 1])
+    v_seg = v[:i_stop + 1]
+    if len(model.acceleration.x) >= n:
+      a_seg = np.asarray(model.acceleration.x, dtype=float)[:i_stop + 1]
+      a_shifted = float(np.interp(extra, x_seg, a_seg))
+    else:
+      a_shifted = float(a_e2e)
+
+    v_shifted = float(np.interp(extra, x_seg, v_seg))
+    return min(float(a_e2e), a_shifted), bool(should_stop_e2e) or (v_shifted < 0.3)
 
   def update(self, sm):
     LongitudinalPlannerSP.update(self, sm)
@@ -161,6 +213,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
     if self.is_e2e(sm):
+      output_a_target_e2e, output_should_stop_e2e = self._adjust_e2e_intersection_stop(
+        sm, v_ego, output_a_target_e2e, output_should_stop_e2e)
       output_a_target = min(output_a_target_e2e, output_a_target_mpc)
       self.output_should_stop = output_should_stop_e2e or output_should_stop_mpc
       if output_a_target < output_a_target_mpc:

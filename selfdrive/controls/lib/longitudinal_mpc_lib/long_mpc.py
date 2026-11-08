@@ -55,6 +55,9 @@ FCW_IDXS = T_IDXS < 5.0
 T_DIFFS = np.diff(T_IDXS, prepend=[0.])
 COMFORT_BRAKE = 2.5
 STOP_DISTANCE = 6.0
+LEAD_STOP_EXTRA = 10 * 0.3048  # extra 10 ft when stopping behind a lead
+LEAD_STOP_V_FULL = 0.5  # m/s: full extra when the lead is stopped
+LEAD_STOP_V_NONE = 5.0  # m/s: no extra at/above about 11 mph
 CRUISE_MIN_ACCEL = -1.2
 CRUISE_MAX_ACCEL = 1.6
 MIN_X_LEAD_FACTOR = 0.5
@@ -326,6 +329,15 @@ class LongitudinalMpc:
     # and then treat that as a stopped car/obstacle at this new distance.
     lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
+    # Extra space when stopping behind a lead, in both experimental and chill.
+    # Full 10 ft if the lead is stopped so we plan that gap on the approach;
+    # blend out as the lead speeds up so highway following is unchanged.
+    if radarstate.leadOne.status:
+      extra_0 = float(np.interp(lead_xv_0[0, 1], [LEAD_STOP_V_FULL, LEAD_STOP_V_NONE], [LEAD_STOP_EXTRA, 0.0]))
+      lead_0_obstacle = lead_0_obstacle - extra_0
+    if radarstate.leadTwo.status:
+      extra_1 = float(np.interp(lead_xv_1[0, 1], [LEAD_STOP_V_FULL, LEAD_STOP_V_NONE], [LEAD_STOP_EXTRA, 0.0]))
+      lead_1_obstacle = lead_1_obstacle - extra_1
 
     # Fake an obstacle for cruise, this ensures smooth acceleration to set speed
     # when the leads are no factor.
