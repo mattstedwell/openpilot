@@ -89,6 +89,10 @@
     "title": "Restore Version",
     "description": ""
   },
+  "Blendful": {
+    "title": "Lane-Center Assist (Blendful)",
+    "description": "When both lane lines are clear, add small steering corrections toward the lane center. Backs off when lines fade, when the model steers around something, and during turns and lane changes."
+  },
   "BlindSpot": {
     "title": "[TIZI/TICI only] Blind Spot Detection",
     "description": "Enabling this will display warnings when a vehicle is detected in your blind spot as long as your car has BSM supported."
