@@ -24,6 +24,12 @@ from openpilot.system.hardware import PC
 
 from openpilot.sunnypilot.system.params_migration import run_migration
 
+# Fork defaults, mirrored from common/params_keys.h: prebuilt branches ship a params_pyx.so
+# compiled with the stock defaults, so set them here too for unset params.
+DEFAULT_OVERRIDES = {
+  "ChevronInfo": 0,
+}
+
 
 def manager_init() -> None:
   save_bootlog()
@@ -56,7 +62,8 @@ def manager_init() -> None:
 
   # set unset params to their default value
   for k in params.all_keys():
-    default_value = params.get_default_value(k)
+    key = k.decode() if isinstance(k, bytes) else k
+    default_value = DEFAULT_OVERRIDES[key] if key in DEFAULT_OVERRIDES else params.get_default_value(k)
     if default_value is not None and params.get(k) is None:
       params.put(k, default_value)
 
