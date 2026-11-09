@@ -30,6 +30,8 @@ DEFAULT_OVERRIDES = {
   "ChevronInfo": 0,
   "SshEnabled": True,
   "AdbEnabled": True,
+  "AutoLaneChangeTimer": 2,
+  "AutoLaneChangeBsmDelay": True,
 }
 
 
