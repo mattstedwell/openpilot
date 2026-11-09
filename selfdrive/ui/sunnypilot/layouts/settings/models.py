@@ -92,14 +92,8 @@ class ModelsLayout(Widget):
 
     self.lagd_toggle = toggle_item_sp(tr("Live Learning Steer Delay"), "", param="LagdToggle")
 
-    self.blendful_toggle = toggle_item_sp(tr("Lane-Center Assist (Blendful)"),
-                                          tr("When both lane lines are clear, add small steering corrections toward the center of the lane. " +
-                                             "Backs off when lines fade, when the model steers around something, and during turns and lane changes."),
-                                          param="Blendful")
-
     self.items = [self.current_model_item, self.cancel_download_item, self.supercombo_label, self.vision_label,
-                  self.policy_label, self.off_policy_label, self.on_policy_label, self.refresh_item, self.clear_cache_item, self.blendful_toggle,
-                  self.lane_turn_desire_toggle,
+                  self.policy_label, self.off_policy_label, self.on_policy_label, self.refresh_item, self.clear_cache_item, self.lane_turn_desire_toggle,
                   self.lane_turn_value_control, self.lagd_toggle, self.delay_control]
 
   def _update_lagd_description(self, lagd_toggle: bool):

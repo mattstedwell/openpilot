@@ -77,11 +77,6 @@ sections:
   title: Camera
   description: Camera position and calibration
   items:
-  - key: Blendful
-    widget: toggle
-    title: Lane-Center Assist (Blendful)
-    description: When both lane lines are clear, add small steering corrections toward the center of the lane. Backs off
-      when lines fade, when the model steers around something, and during turns and lane changes.
   - key: CameraOffset
     widget: option
     title: Adjust Camera Offset

@@ -13,8 +13,6 @@ if USBGPU:
   os.environ['AMD_IFACE'] = 'USB'
 from tinygrad.tensor import Tensor
 import time
-from collections.abc import Callable
-from functools import partial
 import pickle
 import numpy as np
 import cereal.messaging as messaging
@@ -38,7 +36,6 @@ from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
-from openpilot.sunnypilot.modeld_v2.blendful import Blendful
 
 
 PROCESS_NAME = "selfdrive.modeld.modeld"
@@ -58,8 +55,7 @@ assert IMG_QUEUE_SHAPE[0] == 30
 
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
-                          lat_action_t: float, long_action_t: float, v_ego: float,
-                          blendful: Callable[[float], float] | None = None) -> log.ModelDataV2.Action:
+                          lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
     plan = model_output['plan'][0]
     desired_accel, should_stop = get_accel_from_plan(plan[:,Plan.VELOCITY][:,0],
                                                      plan[:,Plan.ACCELERATION][:,0],
@@ -72,8 +68,6 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
                                                 ModelConstants.T_IDXS,
                                                 v_ego,
                                                 lat_action_t)
-    if blendful is not None:
-      desired_curvature += blendful(desired_curvature)
     if v_ego > MIN_LAT_CONTROL_SPEED:
       desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature, LAT_SMOOTH_SECONDS)
     else:
@@ -317,8 +311,6 @@ def main(demo=False):
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
-  blendful = Blendful()
-  blendful_enabled = params.get_bool("Blendful")
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -360,7 +352,6 @@ def main(demo=False):
     v_ego = max(sm["carState"].vEgo, 0.)
     if sm.frame % 60 == 0:
       model.lat_delay = get_lat_delay(params, sm["liveDelay"].lateralDelay)
-      blendful_enabled = params.get_bool("Blendful")
     lat_delay = model.lat_delay + LAT_SMOOTH_SECONDS
     if sm.updated["liveCalibration"] and sm.seen['roadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["liveCalibration"].rpyCalib, dtype=np.float32)
@@ -409,10 +400,7 @@ def main(demo=False):
 
       frame_delay = DT_MDL # compensate for time passed since the frame was captured: current_time - timestamp_eof is 50ms on average
       action_delay = DT_MDL / 2 # middle of the interval between model output (current state) and next frame (expected state)
-      # Blendful lane-center assist: only while steering is engaged and the model isn't changing lanes or turning
-      blendful_active = sm['carControl'].latActive and desire == log.Desire.none and DH.lane_change_state == log.LaneChangeState.off
-      action = get_action_from_model(model_output, prev_action, lat_delay + frame_delay + action_delay, long_delay + frame_delay + action_delay, v_ego,
-                                     partial(blendful.update, model_output, v_ego, blendful_active, enabled=blendful_enabled))
+      action = get_action_from_model(model_output, prev_action, lat_delay + frame_delay + action_delay, long_delay + frame_delay + action_delay, v_ego)
       prev_action = action
       fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
