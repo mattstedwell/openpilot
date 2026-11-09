@@ -29,6 +29,7 @@ from openpilot.sunnypilot.system.params_migration import run_migration
 DEFAULT_OVERRIDES = {
   "ChevronInfo": 0,
   "SshEnabled": True,
+  "AdbEnabled": True,
 }
 
 
