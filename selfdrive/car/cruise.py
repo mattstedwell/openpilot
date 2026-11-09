@@ -4,7 +4,6 @@ import numpy as np
 from cereal import car
 from openpilot.common.constants import CV
 from openpilot.sunnypilot.selfdrive.car.cruise_ext import VCruiseHelperSP
-from openpilot.sunnypilot.selfdrive.car.chill_aggressive import SpeedLimitCruiseTarget
 
 
 # WARNING: this value was determined based on the model's training distribution,
@@ -34,9 +33,6 @@ class VCruiseHelper(VCruiseHelperSP):
   def __init__(self, CP, CP_SP):
     VCruiseHelperSP.__init__(self, CP, CP_SP)
     self.CP = CP
-    self.speed_limit_target = SpeedLimitCruiseTarget()
-    self.detected_speed_limit = 0.
-    self.pcm_speed_prev = None
     self.v_cruise_kph = V_CRUISE_UNSET
     self.v_cruise_cluster_kph = V_CRUISE_UNSET
     self.v_cruise_kph_last = 0
@@ -47,10 +43,7 @@ class VCruiseHelper(VCruiseHelperSP):
   def v_cruise_initialized(self):
     return self.v_cruise_kph != V_CRUISE_UNSET
 
-  def update_v_cruise(self, CS, enabled, is_metric, experimental_mode=True, personality=None):
-    self.speed_limit_target.update_state(enabled and CS.cruiseState.available,
-                                         any(b.type == ButtonType.cancel and b.pressed for b in CS.buttonEvents),
-                                         experimental_mode, personality)
+  def update_v_cruise(self, CS, enabled, is_metric):
     self.v_cruise_kph_last = self.v_cruise_kph
 
     self.get_minimum_set_speed(is_metric)
@@ -61,22 +54,11 @@ class VCruiseHelper(VCruiseHelperSP):
       if not self.CP.pcmCruise or (not self.CP_SP.pcmCruiseSpeed and _enabled):
         # if stock cruise is completely disabled, then we can use our own set speed logic
         self._update_v_cruise_non_pcm(CS, _enabled, is_metric)
-        if not self.speed_limit_target.mode:
-          self.update_speed_limit_assist_v_cruise_non_pcm()
+        self.update_speed_limit_assist_v_cruise_non_pcm()
         self.v_cruise_cluster_kph = self.v_cruise_kph
       else:
-        # Keep the software target anchored to limit+5, and translate subsequent
-        # stock set-speed changes as driver deltas rather than jumping back to
-        # the PCM's pre-offset set speed. Repeated PCM reports aren't overrides.
-        if self.speed_limit_target.applied and self.speed_limit_target.enabled and self.pcm_speed_prev is not None:
-          if CS.cruiseState.speed > 0 and self.pcm_speed_prev > 0 and CS.cruiseState.speed != self.pcm_speed_prev:
-            self.v_cruise_kph = np.clip(self.v_cruise_kph + (CS.cruiseState.speed - self.pcm_speed_prev) * CV.MS_TO_KPH,
-                                       self.v_cruise_min, V_CRUISE_MAX)
-            self.v_cruise_cluster_kph = self.v_cruise_kph
-            self.speed_limit_target.manual_speed_changed()
-        else:
-          self.v_cruise_kph = CS.cruiseState.speed * CV.MS_TO_KPH
-          self.v_cruise_cluster_kph = CS.cruiseState.speedCluster * CV.MS_TO_KPH
+        self.v_cruise_kph = CS.cruiseState.speed * CV.MS_TO_KPH
+        self.v_cruise_cluster_kph = CS.cruiseState.speedCluster * CV.MS_TO_KPH
         if CS.cruiseState.speed == 0:
           self.v_cruise_kph = V_CRUISE_UNSET
           self.v_cruise_cluster_kph = V_CRUISE_UNSET
@@ -87,17 +69,8 @@ class VCruiseHelper(VCruiseHelperSP):
       self.v_cruise_kph = V_CRUISE_UNSET
       self.v_cruise_cluster_kph = V_CRUISE_UNSET
 
-    self.pcm_speed_prev = CS.cruiseState.speed if CS.cruiseState.available else None
-    self.apply_speed_limit_target()
-
     if not self.CP.pcmCruise or not self.CP_SP.pcmCruiseSpeed:
       self.update_button_timers(CS, enabled)
-
-  def apply_speed_limit_target(self):
-    target = self.speed_limit_target.target_kph(self.detected_speed_limit, self.v_cruise_min, V_CRUISE_MAX)
-    if target is not None:
-      self.v_cruise_kph = target
-      self.v_cruise_cluster_kph = target
 
   def _update_v_cruise_non_pcm(self, CS, enabled, is_metric):
     # handle button presses. TODO: this should be in state_control, but a decelCruise press
@@ -138,10 +111,9 @@ class VCruiseHelper(VCruiseHelperSP):
     # Speed Limit Assist for Non PCM long cars.
     # True: Disallow set speed changes when user confirmed the target set speed during preActive state
     # False: Allow set speed changes as SLA is not requesting user confirmation
-    if not self.speed_limit_target.mode and self.update_speed_limit_assist_pre_active_confirmed(button_type):
+    if self.update_speed_limit_assist_pre_active_confirmed(button_type):
       return
 
-    previous_speed = self.v_cruise_kph
     long_press, v_cruise_delta = VCruiseHelperSP.update_v_cruise_delta(self, long_press, v_cruise_delta)
     if long_press and self.v_cruise_kph % v_cruise_delta != 0:  # partial interval
       self.v_cruise_kph = CRUISE_NEAREST_FUNC[button_type](self.v_cruise_kph / v_cruise_delta) * v_cruise_delta
@@ -153,8 +125,6 @@ class VCruiseHelper(VCruiseHelperSP):
       self.v_cruise_kph = max(self.v_cruise_kph, CS.vEgo * CV.MS_TO_KPH)
 
     self.v_cruise_kph = np.clip(round(self.v_cruise_kph, 1), self.v_cruise_min, V_CRUISE_MAX)
-    if self.v_cruise_kph != previous_speed:
-      self.speed_limit_target.manual_speed_changed()
 
   def update_button_timers(self, CS, enabled):
     # increment timer for buttons still pressed
@@ -182,4 +152,3 @@ class VCruiseHelper(VCruiseHelperSP):
       self.v_cruise_kph = int(round(np.clip(CS.vEgo * CV.MS_TO_KPH, initial, V_CRUISE_MAX)))
 
     self.v_cruise_cluster_kph = self.v_cruise_kph
-    self.apply_speed_limit_target()

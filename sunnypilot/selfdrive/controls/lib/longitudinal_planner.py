@@ -8,7 +8,6 @@ See the LICENSE.md file in the root directory for more details.
 from cereal import messaging, custom
 from opendbc.car import structs
 from openpilot.common.constants import CV
-from openpilot.sunnypilot.selfdrive.car.chill_aggressive import is_chill_aggressive
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
@@ -60,10 +59,7 @@ class LongitudinalPlannerSP:
 
     # Speed Limit Assist
     has_speed_limit = self.resolver.speed_limit_valid or self.resolver.speed_limit_last_valid
-    # The cruise helper owns the exact +5 mph target and driver-override latch in
-    # this profile. Don't let legacy SLA impose a second offset/target underneath it.
-    chill_aggressive = is_chill_aggressive(sm['selfdriveState'].experimentalMode, sm['selfdriveState'].personality)
-    self.sla.update(long_enabled and not chill_aggressive, long_override, v_ego, a_ego, v_cruise_cluster, self.resolver.speed_limit,
+    self.sla.update(long_enabled, long_override, v_ego, a_ego, v_cruise_cluster, self.resolver.speed_limit,
                     self.resolver.speed_limit_final_last, has_speed_limit, self.resolver.distance, self.events_sp)
 
     targets = {
