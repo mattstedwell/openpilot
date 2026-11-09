@@ -28,6 +28,7 @@ from openpilot.sunnypilot.system.params_migration import run_migration
 # compiled with the stock defaults, so set them here too for unset params.
 DEFAULT_OVERRIDES = {
   "ChevronInfo": 0,
+  "SshEnabled": True,
 }
 
 
