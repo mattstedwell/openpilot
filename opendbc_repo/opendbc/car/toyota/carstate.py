@@ -193,9 +193,11 @@ class CarState(CarStateBase, CarStateExt):
       self.lkas_button = cp_cam.vl["LKAS_HUD"]["LDA_ON_MESSAGE"]
 
       # Cycles between 1 and 2 when pressing the button, then rests back at 0 after ~3s
+      # The LTA button acts as a software cruise SET press (openpilot uses detected limit + 5 mph).
+      # This is a carState event only; nothing is sent on the bus for it.
       if self.lkas_button != 0 and self.lkas_button != prev_lkas_button:
-        buttonEvents.extend(create_button_events(1, 0, {1: ButtonType.lkas}) +
-                            create_button_events(0, 1, {1: ButtonType.lkas}))
+        buttonEvents.extend(create_button_events(1, 0, {1: ButtonType.setCruise}) +
+                            create_button_events(0, 1, {1: ButtonType.setCruise}))
 
       if self.CP.carFingerprint not in (RADAR_ACC_CAR | SECOC_CAR):
         # distance button is wired to the ACC module (camera or radar)
