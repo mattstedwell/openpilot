@@ -17,6 +17,7 @@ from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 from openpilot.sunnypilot.selfdrive.car.chill_aggressive import ChillAggressiveLaunch
+from openpilot.sunnypilot.selfdrive.car import chill_relaxed
 
 A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
@@ -42,8 +43,11 @@ E2E_GREEN_FUTURE_STOP_X = 2.0
 _A_TOTAL_MAX_V = [1.7, 3.2]
 _A_TOTAL_MAX_BP = [20., 40.]
 
-def get_max_accel(v_ego, chill_aggressive_launch=False):
+def get_max_accel(v_ego, chill_aggressive_launch=False, chill_relaxed_mode=False):
   stock = np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
+  if chill_relaxed_mode:
+    # Chill + Relaxed: gentler acceleration toward the target speed/gap.
+    return stock * chill_relaxed.MAX_ACCEL_SCALE
   return stock + (ChillAggressiveLaunch.accel_extra(v_ego) if chill_aggressive_launch else 0.)
 
 def get_coast_accel(pitch):
@@ -253,7 +257,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     launch_boost = self.chill_aggressive_launch.update(
       sm['carControl'].enabled, sm['selfdriveState'].experimentalMode, sm['selfdriveState'].personality,
       v_ego, v_cruise if v_cruise_initialized else 0., sm['carState'].brakePressed)
-    accel_clip = [ACCEL_MIN, get_max_accel(v_ego, launch_boost)]
+    chill_relaxed_mode = chill_relaxed.is_chill_relaxed(sm['selfdriveState'].experimentalMode, sm['selfdriveState'].personality)
+    accel_clip = [ACCEL_MIN, get_max_accel(v_ego, launch_boost, chill_relaxed_mode)]
     steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['liveParameters'].angleOffsetDeg
     accel_clip = limit_accel_in_turns(v_ego, steer_angle_without_offset, accel_clip, self.CP)
 
@@ -279,7 +284,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     if force_slow_decel:
       v_cruise = 0.0
 
-    self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
+    self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality,
+                         experimental_mode=sm['selfdriveState'].experimentalMode)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
     self.mpc.update(sm['radarState'], v_cruise, personality=sm['selfdriveState'].personality,
                     experimental_mode=sm['selfdriveState'].experimentalMode,
