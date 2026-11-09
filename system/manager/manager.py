@@ -32,6 +32,8 @@ DEFAULT_OVERRIDES = {
   "AdbEnabled": True,
   "AutoLaneChangeTimer": 2,
   "AutoLaneChangeBsmDelay": True,
+  "OnroadScreenOffBrightness": 2,
+  "OnroadScreenOffTimer": 3,
 }
 
 

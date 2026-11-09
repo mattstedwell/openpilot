@@ -16,11 +16,11 @@ sections:
     title: Onroad Brightness
     options:
     - value: 0
-      label: Auto (Default)
+      label: Auto
     - value: 1
       label: Auto (Dark)
     - value: 2
-      label: Screen Off
+      label: Screen Off (Default)
     - value: 3
       label: 5 %
     - value: 4

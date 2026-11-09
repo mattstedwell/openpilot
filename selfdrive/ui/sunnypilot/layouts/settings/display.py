@@ -71,13 +71,13 @@ class DisplayLayout(Widget):
   @staticmethod
   def update_onroad_brightness(val):
     if val == OnroadBrightness.AUTO:
-      return tr("Auto (Default)")
+      return tr("Auto")
 
     if val == OnroadBrightness.AUTO_DARK:
       return tr("Auto (Dark)")
 
     if val == OnroadBrightness.SCREEN_OFF:
-      return tr("Screen Off")
+      return tr("Screen Off (Default)")
 
     return f"{(val - 2) * 5} %"
 

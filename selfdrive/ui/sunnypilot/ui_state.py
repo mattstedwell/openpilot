@@ -217,7 +217,7 @@ class DeviceSP:
         return max(30.0, cur_brightness)
       return cur_brightness
 
-    # 0: Auto (Default), 1: Auto (Dark), 2: Screen Off
+    # 0: Auto, 1: Auto (Dark), 2: Screen Off (Default)
     if _ui_state.onroad_brightness == OnroadBrightness.AUTO:
       return cur_brightness
     if _ui_state.onroad_brightness == OnroadBrightness.AUTO_DARK:
