@@ -30,7 +30,7 @@ E2E_PLANNED_STOP_V = 0.5  # m/s
 E2E_LEAD_STOP_MARGIN = 5.0  # m
 
 # After a confirmed green, use chill/MPC accel instead of the model's timid launch.
-E2E_GREEN_PATH_X = 25 * 0.3048  # 25 feet
+E2E_GREEN_PATH_X = 30.0
 E2E_LAUNCH_BRAKE_YIELD = -0.3
 # Require a real stop-then-go (green) before launching from a light.
 E2E_GREEN_ARM_S = 0.6
