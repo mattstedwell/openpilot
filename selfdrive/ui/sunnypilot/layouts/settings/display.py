@@ -4,19 +4,13 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
-from enum import IntEnum
 
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.sunnypilot.widgets.list_view import option_item_sp
 from openpilot.sunnypilot.system.params_migration import ONROAD_BRIGHTNESS_TIMER_VALUES
-
-
-class OnroadBrightness(IntEnum):
-  AUTO = 0
-  AUTO_DARK = 1
-  SCREEN_OFF = 2
+from openpilot.selfdrive.ui.sunnypilot.onroad_brightness import OnroadBrightness
 
 
 class DisplayLayout(Widget):
