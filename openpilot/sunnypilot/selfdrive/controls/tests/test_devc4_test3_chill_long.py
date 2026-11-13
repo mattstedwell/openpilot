@@ -10,7 +10,6 @@ Rel 12.686 / 15.014).
 
 Host-safe (stubs the aarch64 solver). Nothing here is road-tested.
 Experimental / e2e paths are not part of this port. Always-Chill stays on.
-Aggressive Chill T_FOLLOW is 1.5 s (Matt t290u/t291u; C3X was 1.25).
 No test2 or test4 long tunes.
 """
 from openpilot.sunnypilot.selfdrive.controls.tests.host_stubs import install as _install_host_stubs
@@ -81,12 +80,11 @@ def test_t_follow_chill_relaxed_breakpoints():
   assert 2.04 < expected < 2.06
 
 
-def test_t_follow_standard_and_aggressive():
+def test_t_follow_standard_and_aggressive_unchanged():
   for exp in (False, True):
     for v in (0.0, 13.4, 20.12, 29.06, 40.0):
       assert get_T_FOLLOW(P.standard, exp, v) == 1.45
-      # Chill Aggressive is 1.5 s (Matt t290u/t291u); Experimental keeps official 1.25.
-      assert get_T_FOLLOW(P.aggressive, exp, v) == (1.25 if exp else 1.5)
+      assert get_T_FOLLOW(P.aggressive, exp, v) == 1.25
   for v in (0.0, 30.0):
     assert get_T_FOLLOW(P.relaxed, True, v) == 1.75
 
@@ -165,12 +163,12 @@ def test_lead_stop_extra_feet():
 def test_follow_gap_at_city_and_highway_speeds():
   # Analytic desired gap: v^2/(2*COMFORT_BRAKE) + T*v + STOP_DISTANCE.
   # Lead-stop extra is fully blended out by 5 m/s, so moving follow is T only.
-  # Aggressive Chill is 1.5 s (was C3X 1.25). Standard and Relaxed T are unchanged.
+  # Bit-identical to C3X (T_FOLLOW is the same).
   cases = {
-    20: {P.aggressive: 1.5, P.standard: 1.45, P.relaxed: 1.75},
-    30: {P.aggressive: 1.5, P.standard: 1.45, P.relaxed: float(np.interp(30 * MPH, [13.4, 22.4], [1.75, 2.15]))},
-    45: {P.aggressive: 1.5, P.standard: 1.45, P.relaxed: float(np.interp(45 * MPH, [13.4, 22.4], [1.75, 2.15]))},
-    65: {P.aggressive: 1.5, P.standard: 1.45, P.relaxed: 2.15},
+    20: {P.aggressive: 1.25, P.standard: 1.45, P.relaxed: 1.75},
+    30: {P.aggressive: 1.25, P.standard: 1.45, P.relaxed: float(np.interp(30 * MPH, [13.4, 22.4], [1.75, 2.15]))},
+    45: {P.aggressive: 1.25, P.standard: 1.45, P.relaxed: float(np.interp(45 * MPH, [13.4, 22.4], [1.75, 2.15]))},
+    65: {P.aggressive: 1.25, P.standard: 1.45, P.relaxed: 2.15},
   }
   for mph, pers in cases.items():
     v = mph * MPH

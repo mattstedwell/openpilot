@@ -81,9 +81,7 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard, experimental_
   elif personality==log.LongitudinalPersonality.standard:
     return 1.45
   elif personality==log.LongitudinalPersonality.aggressive:
-    # Chill (this branch is always Chill): 1.5 s, Matt t290u/t291u.
-    # Experimental keeps the official 1.25 so stock tests are unchanged.
-    return 1.25 if experimental_mode else 1.5
+    return 1.25
   else:
     raise NotImplementedError("Longitudinal personality not supported")
 
@@ -313,11 +311,6 @@ class LongitudinalMpc:
       v_lead = lead.vLead
       a_lead = lead.aLeadK
       a_lead_tau = lead.aLeadTau
-      # Persist a clearly-stopping lead's decel so the plan can start
-      # earlier and the last-5-mph chauffeur taper can stay gentle.
-      from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_final_stop import (
-        stopping_a_lead_tau)
-      a_lead_tau = stopping_a_lead_tau(v_ego, a_lead, a_lead_tau, v_lead)
     else:
       # Fake a fast lead car, so mpc can keep running in the same mode
       x_lead = 50.0
@@ -354,20 +347,9 @@ class LongitudinalMpc:
     lead_stop_extra = get_lead_stop_extra(personality, experimental_mode)
     if _present(radarstate.leadOne):
       extra_0 = float(np.interp(lead_xv_0[0, 1], [LEAD_STOP_V_FULL, LEAD_STOP_V_NONE], [lead_stop_extra, 0.0]))
-      # Late reserved extra offsets chauffeur-taper roll so the
-      # standstill floor is not eaten; 0 when the stop extra is
-      # already blended out (moving follow unchanged).
-      if extra_0 > 0.0:
-        from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_final_stop import (
-          taper_comp_shift)
-        extra_0 = extra_0 + taper_comp_shift(v_ego)
       lead_0_obstacle = lead_0_obstacle - extra_0
     if _present(radarstate.leadTwo):
       extra_1 = float(np.interp(lead_xv_1[0, 1], [LEAD_STOP_V_FULL, LEAD_STOP_V_NONE], [lead_stop_extra, 0.0]))
-      if extra_1 > 0.0:
-        from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_final_stop import (
-          taper_comp_shift)
-        extra_1 = extra_1 + taper_comp_shift(v_ego)
       lead_1_obstacle = lead_1_obstacle - extra_1
 
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])
@@ -383,14 +365,7 @@ class LongitudinalMpc:
     self.params[:,2] = np.min(x_obstacles, axis=1)
     self.params[:,3] = np.copy(self.a_prev)
     self.params[:,4] = t_follow
-    # Never plan closer than the planned standstill gap (hard floor
-    # at every speed). Raises the official 0.75 danger factor at low
-    # speed so the slack constraint sits on the floor; at city and
-    # highway speeds 0.75 * desired is already well above it.
-    from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_min_gap import (
-      danger_factor_for_floor)
-    v_lead_0 = float(lead_xv_0[0, 1]) if lead_xv_0 is not None else 0.0
-    self.params[:,5] = danger_factor_for_floor(v_ego, v_lead_0, personality, experimental_mode)
+    self.params[:,5] = LEAD_DANGER_FACTOR
 
     self.run()
     if (np.any(lead_xv_0[FCW_IDXS,0] - self.x_sol[FCW_IDXS,0] < CRASH_DISTANCE) and

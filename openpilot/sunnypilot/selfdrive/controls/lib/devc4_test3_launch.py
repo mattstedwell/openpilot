@@ -49,12 +49,6 @@ LAUNCH_JERK_UP = 0.40             # m/s³; lead-launch ramp
 LAUNCH_GO_V_LEAD = 0.10           # m/s; lead must be clearly moving (~0.22 mph)
 LAUNCH_GO_PULL_AWAY = 0.05        # m/s; v_lead - v_ego, gap growing
 LAUNCH_GO_V_EGO_MAX = 4.5         # m/s (~10 mph)
-# already_active may hold a little past 10 mph so the hand-off does
-# not flicker, but must NEVER stay in take-up at city speeds. The
-# previous already_active branch ignored v_ego entirely and stayed
-# on through 25-30 mph, ramping to the personality cap and closing
-# the gap well below desired (and even below the standstill floor).
-LAUNCH_GO_V_EGO_HOLD = 5.0        # m/s (~11.2 mph); already_active ceiling
 LAUNCH_GO_MIN_GAP = 3.5           # m; safety floor (independent of stop extras)
 LAUNCH_GO_V_CRUISE = 0.5          # m/s; no-lead set-speed margin
 LAUNCH_GO_CONFIRM = 2             # planner frames of go before the 0.30 step
@@ -128,8 +122,7 @@ def launch_go(present, d_rel, v_lead, v_ego, v_cruise, fcw=False,
     pulling = v_lead > LAUNCH_GO_V_LEAD and v_lead >= v_ego + LAUNCH_GO_PULL_AWAY
     if (pulling or departing) and v_ego <= LAUNCH_GO_V_EGO_MAX:
       return True
-    if (already_active and v_ego <= LAUNCH_GO_V_EGO_HOLD
-        and v_lead > LAUNCH_GO_V_LEAD and v_lead >= v_ego - LAUNCH_GO_CATCH):
+    if already_active and v_lead > LAUNCH_GO_V_LEAD and v_lead >= v_ego - LAUNCH_GO_CATCH:
       return True
     return False
   if not (_finite(v_ego, v_cruise)):
@@ -280,8 +273,7 @@ class LeadLaunch:
     self.launch.reset(a)
 
   def apply(self, a_chosen, should_stop, v_ego, v_cruise, lead, fcw, dt,
-            cap=float("inf"), jerk_up=LAUNCH_JERK_UP, v_ego_stopping=0.25,
-            desired_gap=None, min_gap_floor=None):
+            cap=float("inf"), jerk_up=LAUNCH_JERK_UP, v_ego_stopping=0.25):
     present = _lead_present(lead)
     d_rel = getattr(lead, "dRel", float("nan")) if present else float("nan")
     v_lead = getattr(lead, "vLead", float("nan")) if present else float("nan")
@@ -289,17 +281,9 @@ class LeadLaunch:
 
     hard = launch_hard(present, d_rel, v_lead, fcw=fcw, a_chosen=a_chosen,
                        a_lead=a_lead if present else None)
-    # A gap under the planned standstill floor is always a hard release.
-    if present and _finite(d_rel, min_gap_floor) and d_rel < min_gap_floor:
-      hard = True
     go = launch_go(present, d_rel, v_lead, v_ego, v_cruise, fcw=fcw,
                    already_active=self.launch.active,
                    a_lead=a_lead if present else None)
-    # Never close the gap below the desired follow: hand back to the
-    # chosen (MPC) plan. go=False + active uses the soft-exit path,
-    # which ramps toward a_chosen (not toward the cap).
-    if present and _finite(d_rel, desired_gap) and d_rel < desired_gap:
-      go = False
     a = self.launch.update(go, a_chosen, cap, jerk_up, dt,
                            v_ego=v_ego, v_lead=v_lead if present else None,
                            a_lead=a_lead if present else None, hard=hard)
