@@ -38,7 +38,7 @@ class TestFollowingDistance(OpenpilotTestCase):
   def test_following_distance(self):
     v_lead = float(self.speed)
     simulation_steady_state = run_following_distance_simulation(v_lead, personality=self.personality)
-    correct_steady_state = desired_follow_distance(v_lead, v_lead, get_T_FOLLOW(self.personality))
+    correct_steady_state = desired_follow_distance(v_lead, v_lead, get_T_FOLLOW(self.personality, False, v_lead))
     abs_err_margin = 0.5 if v_lead > 0.0 else 1.15
     self.assertAlmostEqual(simulation_steady_state, correct_steady_state,
                            delta=0.2 * correct_steady_state + abs_err_margin)
