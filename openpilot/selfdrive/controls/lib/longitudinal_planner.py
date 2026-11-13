@@ -23,6 +23,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_launch import (
   LeadLaunch, LAUNCH_JERK_UP, desired_follow_gap)
 from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_final_stop import (
   FinalStopTaper, FINAL_STOP_MIN_GAP)
+from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_lead_slow import LeadSlow
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -92,6 +93,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.output_should_stop = False
     self.chill_aggressive_launch = ChillAggressiveLaunch()
     self.lead_launch = LeadLaunch()
+    self.lead_slow = LeadSlow()
     self.final_stop = FinalStopTaper()
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
@@ -192,6 +194,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # the Aggressive +0.4 launch boost. A stopped lead never triggers go.
     if reset_state:
       self.lead_launch.reset(float(self.output_a_target))
+      self.lead_slow.reset(float(self.output_a_target))
       self.final_stop.reset(float(self.output_a_target))
     else:
       lead_one = sm['radarState'].leadOne
@@ -203,14 +206,24 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
         cap=cap, jerk_up=LAUNCH_JERK_UP,
         v_ego_stopping=getattr(self.CP, "vEgoStopping", 0.25),
         desired_gap=desired)
-      # Chauffeur last-5-mph taper and 5-8 mph command freeze for the
-      # Highlander Hybrid regen-friction handoff and the official-dev
-      # final-stop lurch. Urgent / FCW / TTC<2 s / gap under 3.5 m /
-      # launch (positive) pass through at full braking. Does not use
-      # a min-gap floor and does not change T_FOLLOW.
+      # Agg/Std: Relaxed-like earlier, gentler approach to a stopped
+      # or slowing lead (t303u / t304u). Relaxed is a bit-identical
+      # passthrough so its 5ea539 approach is unchanged. T_FOLLOW
+      # stays 1.25 / 1.45 / Relaxed. Not a min-gap PD floor.
+      a_slow = self.lead_slow.apply(
+        float(a_ls), v_ego, lead_one, personality, self.fcw, self.dt,
+        desired_gap=desired, a_prev=a_prev, experimental_mode=exp_mode)
+      # Chauffeur last-mph taper and regen-friction command freeze
+      # for the Highlander Hybrid handoff and the official-dev
+      # final-stop lurch. Relaxed is 5ea539 (5-8 mph, -0.08, 6.0 m
+      # residual). Agg/Std: 17-2 mph hold, -0.12 rest, 24.7 ft
+      # kinematic. Urgent / FCW / TTC<2 s / gap under 3.5 m /
+      # launch (positive) pass through at full braking.
       a_fs = self.final_stop.apply(
-        float(a_ls), v_ego, lead_one, self.fcw, self.dt,
-        should_stop=bool(ss), a_prev=a_prev, min_gap=FINAL_STOP_MIN_GAP)
+        float(a_slow), v_ego, lead_one, self.fcw, self.dt,
+        should_stop=bool(ss), a_prev=a_prev, min_gap=FINAL_STOP_MIN_GAP,
+        personality=personality, experimental_mode=exp_mode,
+        desired_gap=desired)
       self.output_a_target = float(np.clip(a_fs, ACCEL_MIN, cap))
       self.output_should_stop = ss
 

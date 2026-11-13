@@ -113,6 +113,16 @@ TAPER_COMP_V_NONE = 6.0
 # then slamming (the 5 mph start bug).
 KINEMATIC_MARGIN_M = 6.0  # official STOP_DISTANCE; residual only, not a follow floor
 
+# Agg/Std only (t304u): Relaxed keeps the 5ea539 constants above.
+# Planned standstill is STOP_DISTANCE (6.0) + 5 ft Chill extra.
+AGG_STD_STANDSTILL_M = 6.0 + 5.0 * 0.3048  # 7.524 m = 24.69 ft
+# Hold through the hybrid 7-17 mph blend (Tomorrow's Technician),
+# then a short last-2-mph taper so already-stopped finishes at
+# 24.7 ft and no-lead stops are not a 30 s creep at -0.08.
+AGG_BLEND_HI = FINAL_STOP_BLEND_HI  # 8 mph, same as Relaxed; last taper is 2 mph
+AGG_BLEND_LO = FINAL_STOP_BLEND_LO  # 5 mph, same as Relaxed, so a 5 mph stopping lead is in the last taper (not frozen in the hold band)
+AGG_REST_DECEL = 0.12
+
 
 def _finite(*xs) -> bool:
   return all(x is not None and np.isfinite(x) for x in xs)
@@ -155,10 +165,19 @@ def _lead_present(lead) -> bool:
   return False
 
 
-def last5_envelope(v_ego: float, start_a: float = None) -> float:
+def last5_envelope(v_ego: float, start_a: float = None,
+                   blend_lo=None, rest_decel=None, rest_v=None) -> float:
   """Signed accel in the last 5 mph: C2 from start_a at 5 mph to
   -REST at 0, finishing the rest value by REST_V. Above 5 mph this
-  returns start_a (the 5-8 mph band is held flat by the caller)."""
+  returns start_a (the 5-8 mph band is held flat by the caller).
+
+  Optional blend_lo / rest_decel / rest_v default to the 5ea539
+  Relaxed values so existing callers and unit tests are unchanged.
+  Agg/Std pass a shorter last-2-mph window and a slightly firmer rest.
+  """
+  blend_lo = FINAL_STOP_BLEND_LO if blend_lo is None else float(blend_lo)
+  rest_decel = FINAL_STOP_REST_DECEL if rest_decel is None else float(rest_decel)
+  rest_v = FINAL_STOP_REST_V if rest_v is None else float(rest_v)
   start = -FINAL_STOP_LAST5_START if not _finite(start_a) else float(start_a)
   if start > 0.0:
     start = 0.0
@@ -166,26 +185,27 @@ def last5_envelope(v_ego: float, start_a: float = None) -> float:
     if v_ego > 0.0:
       return start
     if v_ego < 0.0:
-      return -FINAL_STOP_REST_DECEL
+      return -rest_decel
     return float("nan")
   v = max(float(v_ego), 0.0)
-  if v >= FINAL_STOP_BLEND_LO:
+  if v >= blend_lo:
     return start
-  if v <= FINAL_STOP_REST_V:
+  if v <= rest_v:
     if v <= 0.0:
-      return -FINAL_STOP_REST_DECEL
-    # C2 from -REST at 0 to the 5-mph-taper value at REST_V, so the
+      return -rest_decel
+    # C2 from -REST at 0 to the taper value at REST_V, so the
     # rest command is reached slightly early (actuator delay).
-    t = v / FINAL_STOP_REST_V
+    t = v / rest_v
     s = _smootherstep(t)
-    rest = -FINAL_STOP_REST_DECEL
-    at_rv = last5_envelope(FINAL_STOP_REST_V + 1e-6, start)
+    rest = -rest_decel
+    at_rv = last5_envelope(rest_v + 1e-6, start,
+                           blend_lo=blend_lo, rest_decel=rest_decel, rest_v=rest_v)
     return rest + (at_rv - rest) * s
   # C2 from value at REST_V (≈ rest, after the inner branch) — use
-  # linear-in-smootherstep from start at 5 mph to rest at REST_V.
-  t = (FINAL_STOP_BLEND_LO - v) / (FINAL_STOP_BLEND_LO - FINAL_STOP_REST_V)
+  # linear-in-smootherstep from start at blend_lo to rest at REST_V.
+  t = (blend_lo - v) / (blend_lo - rest_v)
   s = _smootherstep(t)
-  return start + (-FINAL_STOP_REST_DECEL - start) * s
+  return start + (-rest_decel - start) * s
 
 
 def final_stop_envelope(v_ego: float) -> float:
@@ -248,9 +268,26 @@ def stopping_a_lead_tau(v_ego, a_lead, a_lead_tau, v_lead) -> float:
   return a_lead_tau
 
 
-def taper_comp_shift(v_ego) -> float:
+def _is_relaxed_personality(personality, experimental_mode=False) -> bool:
+  """True for Chill Relaxed, and for personality=None (the 5ea539
+  default path used by existing unit tests). Does not import
+  LeadSlow (avoid a cycle)."""
+  if personality is None:
+    return True
+  from openpilot.sunnypilot.selfdrive.car import chill_relaxed
+  return bool(chill_relaxed.is_chill_relaxed(experimental_mode, personality))
+
+
+def taper_comp_shift(v_ego, personality=None, experimental_mode=False) -> float:
   """Late reserved extra, meters, to offset chauffeur-taper roll.
-  0 when v_ego is non-finite or above TAPER_COMP_V_NONE."""
+  0 when v_ego is non-finite or above TAPER_COMP_V_NONE.
+
+  All personalities use the 5ea539 values (0.75 m, full by 2 m/s,
+  out by 6 m/s). The personality argument is accepted so the MPC
+  hook can pass it, but Agg/Std already-stopped 24.7 ft is achieved
+  by the kinematic margin, not a larger reserved extra (which
+  would also change mid-speed stop-extra blending).
+  """
   if not _finite(v_ego):
     return 0.0
   return float(np.interp(max(float(v_ego), 0.0),
@@ -258,22 +295,38 @@ def taper_comp_shift(v_ego) -> float:
                          [TAPER_COMP_M, 0.0]))
 
 
-def kinematic_hold(v_ego, d_rel, margin=KINEMATIC_MARGIN_M):
+def kinematic_hold(v_ego, d_rel, margin=KINEMATIC_MARGIN_M, rest=None,
+                   inside="none", taper_lo=None):
   """Most mild (closest to zero) signed accel that still stops with
-  `margin` meters of gap left. None when there is no lead, or the
-  gap is already inside the margin (urgent passthrough handles that).
-  Keeps the last-5-mph taper from coasting into a lead and slamming.
+  `margin` meters of gap left. None when there is no lead, or (5ea539
+  default, inside='none') the gap is already inside the margin
+  (urgent passthrough handles that).
+
+  Agg/Std pass inside='hold' so we do not ease toward rest when
+  already at the planned 24.7 ft while still rolling — the 7.5 m /
+  tight-5-mph hole — but we do allow the rest finish in the last
+  ~0.3 m/s (remaining roll is centimeters).
   """
   if not (_finite(v_ego, d_rel)):
     return None
   v = max(float(v_ego), 0.0)
   if v <= 0.05:
     return None
+  rest = FINAL_STOP_REST_DECEL if rest is None else float(rest)
   s = float(d_rel) - float(margin)
   if s <= 0.3:
-    return None
+    if inside != "hold":
+      return None  # 5ea539 Relaxed / default
+    if v <= 1.0 * MPH:
+      # Last ~1 mph: remaining roll at rest is centimeters; allow the
+      # chauffeur finish so a_at_0 is near -0.12, not a held -1.0+.
+      return -rest
+    s_stop = max(float(d_rel) - max(float(margin) - 0.5, 3.5), 0.2)
+    a_need = (v * v) / (2.0 * s_stop)
+    a_need = min(max(a_need, rest), 2.5)
+    return -a_need
   a_need = (v * v) / (2.0 * s)
-  a_need = min(max(a_need, FINAL_STOP_REST_DECEL), 2.5)
+  a_need = min(max(a_need, rest), 2.5)
   return -a_need
 
 
@@ -306,31 +359,45 @@ def _urgent(a_target, v_ego, v_lead, d_rel, fcw, min_gap=FINAL_STOP_MIN_GAP) -> 
   return False
 
 
-def _is_stop_situation(v_ego, lead, a_target, should_stop) -> bool:
+def _is_stop_situation(v_ego, lead, a_target, should_stop,
+                       blend_hi=FINAL_STOP_BLEND_HI, require_halt=False) -> bool:
   if should_stop:
     return True
-  if _finite(v_ego) and v_ego <= FINAL_STOP_BLEND_HI and _finite(a_target) and a_target < -0.05:
-    return True
   present = _lead_present(lead)
-  if not present:
-    return False
-  v_lead = getattr(lead, "vLead", float("nan"))
-  a_lead = getattr(lead, "aLeadK", getattr(lead, "aLead", float("nan")))
-  if not _finite(v_lead):
-    return False
-  if v_lead <= 0.5:
+  if present:
+    v_lead = getattr(lead, "vLead", float("nan"))
+    a_lead = getattr(lead, "aLeadK", getattr(lead, "aLead", float("nan")))
+    if _finite(v_lead) and v_lead <= 0.5:
+      return True
+    if lead_is_stopping(v_lead, a_lead):
+      return True
+  # Relaxed 5ea539: any braking below blend_hi (8 mph) is a stop
+  # situation. Agg/Std must not use this with blend_hi=17 — a 45→20
+  # slowdown would enter the standstill taper and try to stop at
+  # 24.7 ft behind a lead still doing 20 mph.
+  if not require_halt:
+    if _finite(v_ego) and v_ego <= blend_hi and _finite(a_target) and a_target < -0.05:
+      return True
+  elif (not present) and _finite(v_ego) and v_ego <= blend_hi and _finite(a_target) and a_target < -0.05:
+    # No-lead cruise-to-zero: the 17-2 band is how Agg/Std avoid a 30 s finish.
     return True
-  return lead_is_stopping(v_lead, a_lead)
+  return False
 
 
 class FinalStopTaper:
-  """Planner-side chauffeur taper and 5-8 mph command freeze.
+  """Planner-side chauffeur taper and regen-friction command freeze.
 
-  Above 8 mph: pass through (approach is unsmoothed here). Entering
-  the 5-8 mph band holds the command nearly constant (eases at 0.30
-  toward a comfortable last-5 start only when kinematics allow; never
-  snaps harder during the hybrid handoff). Below 5 mph: jerk-limited C2 taper to -REST. Urgent /
-  FCW / close-gap / positive (launch) pass through bit-identically.
+  Relaxed (and personality=None, the unit-test default): identical to
+  5ea5397a5c. Above 8 mph pass through; 5-8 mph hold/ease at 0.30;
+  last 5 mph C2 taper to -0.08; kinematic residual 6.0 m.
+
+  Aggressive / Standard (t304u): feel like Relaxed on the approach
+  (LeadSlow + MPC jerk), and in this taper: hold through 17-2 mph
+  (hybrid 7-17 band), short last-2-mph taper to -0.12, kinematic
+  margin = planned standstill 7.524 m (24.7 ft) so already-stopped
+  finishes at the set distance. Never ease if the gap is already
+  inside that margin (the 7.5 m / tight-5-mph hole). T_FOLLOW is
+  unchanged. Urgent / FCW / close-gap / launch pass through.
   """
 
   def __init__(self):
@@ -342,7 +409,20 @@ class FinalStopTaper:
     self.blend_hold = None
 
   def apply(self, a_raw, v_ego, lead=None, fcw=False, dt=DT, should_stop=False,
-            a_prev=None, min_gap=FINAL_STOP_MIN_GAP) -> float:
+            a_prev=None, min_gap=FINAL_STOP_MIN_GAP, personality=None,
+            experimental_mode=False, desired_gap=None) -> float:
+    relaxed = _is_relaxed_personality(personality, experimental_mode)
+    if relaxed:
+      blend_hi = FINAL_STOP_BLEND_HI
+      blend_lo = FINAL_STOP_BLEND_LO
+      rest = FINAL_STOP_REST_DECEL
+      margin = KINEMATIC_MARGIN_M
+    else:
+      blend_hi = AGG_BLEND_HI
+      blend_lo = AGG_BLEND_LO
+      rest = AGG_REST_DECEL
+      margin = AGG_STD_STANDSTILL_M
+
     if not _finite(a_raw):
       self.prev = None
       self.blend_hold = None
@@ -364,7 +444,8 @@ class FinalStopTaper:
       self.blend_hold = None
       return float(a_raw)
 
-    if not _is_stop_situation(v_ego, lead, a_raw, should_stop):
+    if not _is_stop_situation(v_ego, lead, a_raw, should_stop, blend_hi=blend_hi,
+                              require_halt=not relaxed):
       self.prev = float(a_raw)
       self.blend_hold = None
       return float(a_raw)
@@ -378,27 +459,46 @@ class FinalStopTaper:
     else:
       prev = float(a_raw)
 
-    # 5-8 mph regen-friction band (Toyota TSB T-SB-0059-23 /
-    # patent US2016/0039292): do not snap the command harder
-    # during the hybrid handoff. If the held value is firmer than
-    # needed and kinematics allow, ease at 0.30 toward a comfortable
-    # last-5 start so the taper can actually finish at -0.08. A
-    # 0.30 m/s³ change is under the Müller 2013 seated JND (~1 m/s³)
-    # and is treated as "held nearly constant" through the blend.
-    if FINAL_STOP_BLEND_LO < v <= FINAL_STOP_BLEND_HI:
+    # Regen-friction band (Toyota TSB T-SB-0059-23 / patent
+    # US2016/0039292): do not snap the command harder during the
+    # hybrid handoff. Relaxed: 5-8 mph (5ea539). Agg/Std: 17-2 mph
+    # so the ease starts earlier and the finish can land at 24.7 ft.
+    # If the held value is firmer than needed and kinematics allow,
+    # ease at 0.30 toward a comfortable last-taper start. Never ease
+    # if Agg/Std are already inside the planned standstill margin.
+    if blend_lo < v <= blend_hi:
       if self.blend_hold is None:
         hold = prev if _finite(prev) else float(a_raw)
         if hold > 0.0:
           hold = 0.0
         self.blend_hold = float(hold)
       hold = self.blend_hold
-      kin = kinematic_hold(v, d_rel)
+      kin = kinematic_hold(v, d_rel, margin=margin, rest=rest,
+                           inside="none" if relaxed else "hold",
+                           taper_lo=None if relaxed else blend_lo)
       comfortable = -FINAL_STOP_LAST5_START
       mildest = comfortable if kin is None else min(comfortable, kin)
-      if hold < mildest:
+      lead_moving = (not relaxed) and _finite(v_lead) and v_lead > 0.5
+      if lead_moving:
+        # Standstill kinematic is invalid behind a still-moving lead.
+        # If we are already braking, hold the command (hybrid blend:
+        # never snap harder, don't ease into a shrinking gap). If
+        # we entered at ~0, do not freeze at zero — that delayed
+        # a 5 mph stopping-lead and finished at 12 ft.
+        if hold > -0.05:
+          target = float(a_raw) if a_raw < -0.05 else comfortable
+        else:
+          target = hold
+      elif hold < mildest:
         target = mildest
       elif kin is not None and hold > kin:
         target = kin
+      elif (not relaxed) and hold > comfortable:
+        # Entered the band at ~0 (no-lead start at 5-17 mph, or a
+        # late onset): start the comfortable last-taper decel,
+        # jerk-limited. Relaxed stays 5ea539 (hold 0 if entered at 0;
+        # last-5 _start_for_last5 handles a 5 mph start).
+        target = comfortable if kin is None else min(comfortable, kin)
       else:
         target = hold
       limited = _jerk_toward(prev, target, FINAL_STOP_JERK, dtc)
@@ -408,23 +508,26 @@ class FinalStopTaper:
       self.prev = float(limited)
       return float(limited)
 
-    if v <= FINAL_STOP_BLEND_LO:
+    if v <= blend_lo:
       start = _start_for_last5(self.blend_hold, prev, a_raw)
-      env = last5_envelope(v, start)
+      env = last5_envelope(v, start, blend_lo=blend_lo, rest_decel=rest,
+                           rest_v=FINAL_STOP_REST_V)
       # Ease a stronger (more negative) raw onto the chauffeur taper;
       # if the raw is already milder, do not fight it downward, but
       # never go positive — unless kinematics need more decel to stop.
       shaped = max(float(a_raw), env)
       if shaped > 0.0:
         shaped = 0.0
-      kin = kinematic_hold(v, d_rel)
+      kin = kinematic_hold(v, d_rel, margin=margin, rest=rest,
+                           inside="none" if relaxed else "hold",
+                           taper_lo=None if relaxed else max(v, 0.0))
       if kin is not None and shaped > kin:
         shaped = kin
       j = stop_jerk(d_rel, v_ego, v_lead, a_raw)
-      # In the last 5 mph of a comfortable stop, stay at the design
+      # In the last taper of a comfortable stop, stay at the design
       # 0.30 even if TTC is shrinking a little — "very low jerk."
       # Urgent TTC already passed through above.
-      if v <= FINAL_STOP_BLEND_LO:
+      if v <= blend_lo:
         j = min(j, FINAL_STOP_JERK)
       limited = _jerk_toward(prev, shaped, j, dtc)
       if limited > 0.0:
@@ -432,8 +535,8 @@ class FinalStopTaper:
       self.prev = float(limited)
       return float(limited)
 
-    # Above 8 mph on a stop situation: pass the raw approach through.
-    # Remember it so we enter the blend band with a continuous value.
+    # Above the blend band on a stop situation: pass the raw approach
+    # through. Remember it so we enter the band with a continuous value.
     self.blend_hold = float(a_raw) if a_raw <= 0.0 else None
     self.prev = float(a_raw)
     return float(a_raw)
