@@ -2,6 +2,7 @@ import colorsys
 import numpy as np
 import pyray as rl
 from openpilot.cereal import log, messaging
+from openpilot.sunnypilot.selfdrive.car.always_chill import ALWAYS_CHILL
 from opendbc.car.structs import car
 from dataclasses import dataclass, field
 from openpilot.common.params import Params
@@ -165,9 +166,11 @@ class ModelRenderer(Widget, ModelRendererSP):
 
   def _update_leads(self, sm):
     plan = sm['longitudinalPlan']
-    if plan.longitudinalPlanSource == log.LongitudinalPlan.LongitudinalPlanSource.e2e and len(sm['modelV2'].leadsV3) > 1:
+    if (not ALWAYS_CHILL) and plan.longitudinalPlanSource == log.LongitudinalPlan.LongitudinalPlanSource.e2e and len(sm['modelV2'].leadsV3) > 1:
       leads = [(lead.prob > 0.5, lead.x[0], -lead.y[0]) for lead in list(sm['modelV2'].leadsV3)[:2]]
     else:
+      # ALWAYS_CHILL: always use radar/model lead tracks. The e2e
+      # plan-source visualization is unused on this ACC-only branch.
       radar = sm['radarState']
       leads = [(lead.present, lead.dRel + RADAR_TO_CAMERA, lead.yRel) for lead in (radar.leadOne, radar.leadTwo)]
 

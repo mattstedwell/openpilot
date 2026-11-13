@@ -1,5 +1,6 @@
 import pyray as rl
 from openpilot.cereal import log
+from openpilot.sunnypilot.selfdrive.car.always_chill import ALWAYS_CHILL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
@@ -50,7 +51,9 @@ class LongIndicator(Widget):
     plan = sm['longitudinalPlan']
     has_lead = sm.alive['longitudinalPlan'] and plan.hasLead
 
-    e2e = has_lead and plan.longitudinalPlanSource == log.LongitudinalPlan.LongitudinalPlanSource.e2e
+    # e2e plan source is unused on this ACC-only branch; keep the green
+    # "model driving" indicator unreachable.
+    e2e = (not ALWAYS_CHILL) and has_lead and plan.longitudinalPlanSource == log.LongitudinalPlan.LongitudinalPlanSource.e2e
     white_f, green_f = self._lead_car_filters
     white_alpha = white_f.update(0.0 if e2e else 0.9 if has_lead else 0.35)
     green_alpha = green_f.update(float(e2e))

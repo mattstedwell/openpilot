@@ -32,6 +32,7 @@ from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.controller import IntelligentCruiseButtonManagement
 from openpilot.sunnypilot.selfdrive.selfdrived.button_state_tracker import ButtonStateTracker
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
+from openpilot.sunnypilot.selfdrive.car.always_chill import ALWAYS_CHILL
 
 REPLAY = "REPLAY" in os.environ
 SIMULATION = "SIMULATION" in os.environ
@@ -594,6 +595,11 @@ class SelfdriveD:
     ss.state = self.state_machine.state
     ss.engageable = not self.events.contains(ET.NO_ENTRY)
     ss.personality = self.personality
+    # Permanently off when ALWAYS_CHILL. The field lives in the deprecated
+    # group and already defaults to false; there is no toggle or param.
+    # Set it explicitly so it cannot be left true.
+    if ALWAYS_CHILL:
+      ss.deprecated.experimentalMode = False
 
     ss.alertText1 = self.AM.current_alert.alert_text_1
     ss.alertText2 = self.AM.current_alert.alert_text_2

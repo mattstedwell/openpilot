@@ -16,6 +16,7 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
+from openpilot.sunnypilot.selfdrive.car.always_chill import ALWAYS_CHILL
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -29,6 +30,21 @@ def get_cruise_accel(v_cruise, v_ego, a_cruise_prev, dt):
   target_accel = float(np.clip(target_accel, a_cruise_prev - j_cruise * dt, a_cruise_prev + j_cruise * dt))
 
   return target_accel
+
+
+def choose_acc_plan(a_mpc, source_mpc, stop_mpc, a_cruise, stop_cruise):
+  """ACC / Chill longitudinal plan: min of lead-MPC and cruise only.
+
+  Official sunnypilot/dev always also blends the model's
+  desiredAcceleration (the e2e candidate), which is what stops for
+  lights and signs and slows for curves. When ALWAYS_CHILL, that
+  candidate is dropped — the same split as the pre-C4 official Chill
+  path (MPC mode 'acc'). Model shouldStop is not used.
+  """
+  candidates = ((a_mpc, source_mpc, stop_mpc),
+                (a_cruise, LongitudinalPlanSource.cruise, stop_cruise))
+  a_target, source, _ = min(candidates, key=lambda c: c[0])
+  return a_target, source, any(s for _, _, s in candidates)
 
 
 class LongitudinalPlanner(LongitudinalPlannerSP):
@@ -103,20 +119,27 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     output_a_target_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
                                               action_t=action_t)
     output_should_stop_mpc = should_stop(v_ego, output_a_target_mpc)
-    output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
-    output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
     self.a_cruise = get_cruise_accel(v_cruise, v_ego, self.a_cruise, self.dt)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
-    output_a_target_e2e = self.accel_boost.update(sm, output_a_target_e2e, output_a_target_mpc, self.a_cruise)
+    if ALWAYS_CHILL:
+      # Permanent ACC / Chill: lead-MPC and cruise only. The model's
+      # desiredAcceleration and shouldStop are not candidates, so lights,
+      # signs, and model-planned stops do not slow or stop the car.
+      output_a_target, self.mpc.source, self.output_should_stop = choose_acc_plan(
+          output_a_target_mpc, self.mpc.source, output_should_stop_mpc,
+          self.a_cruise, cruise_should_stop)
+    else:
+      output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
+      output_should_stop_e2e = sm['modelV2'].action.shouldStop
+      output_a_target_e2e = self.accel_boost.update(sm, output_a_target_e2e, output_a_target_mpc, self.a_cruise)
+      candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
+                    (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop),
+                    (output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e)]
+      output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
+      self.output_should_stop = any(s for _, _, s in candidates)
 
-    candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
-                  (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop),
-                  (output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e)]
-
-    output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
-    self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
