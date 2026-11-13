@@ -35,7 +35,7 @@ def clamp(value, min_value, max_value):
 class Spinner(Widget):
   def __init__(self):
     super().__init__()
-    self._comma_texture = gui_app.texture("../../sunnypilot/selfdrive/assets/images/spinner_sunnypilot.png", TEXTURE_SIZE, TEXTURE_SIZE)
+    self._comma_texture = gui_app.texture("../../sunnypilot/selfdrive/assets/images/spinner_sunny_pilot_sun.png", TEXTURE_SIZE, TEXTURE_SIZE)
     self._spinner_texture = gui_app.texture("images/spinner_track.png", TEXTURE_SIZE, TEXTURE_SIZE, alpha_premultiply=True)
     self._rotation = 0.0
     self._progress: int | None = None
@@ -68,7 +68,7 @@ class Spinner(Widget):
     delta_time = rl.get_frame_time()
     self._rotation = (self._rotation + DEGREES_PER_SECOND * delta_time) % 360.0
 
-    # Draw rotating spinner and static comma logo
+    # Draw rotating spinner and static logo (devc4-test2: cartoon sun with sunglasses)
     rl.draw_texture_pro(self._spinner_texture, rl.Rectangle(0, 0, TEXTURE_SIZE, TEXTURE_SIZE),
                         rl.Rectangle(center.x, center.y, TEXTURE_SIZE, TEXTURE_SIZE),
                         spinner_origin, self._rotation, rl.WHITE)
