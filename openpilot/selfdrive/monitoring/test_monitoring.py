@@ -1,9 +1,14 @@
+from pathlib import Path
+import hashlib
+import struct
+
 from openpilot.common.parameterized import parameterized
 
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.common.realtime import DT_DMON
+from openpilot.selfdrive.monitoring import policy as dm_policy
 from openpilot.selfdrive.monitoring.policy import DriverMonitoring, DRIVER_MONITOR_SETTINGS
 
 EventName = log.OnroadEvent.EventName
@@ -52,6 +57,16 @@ always_true = [True] * int(TEST_TIMESPAN / DT_DMON)
 always_false = [False] * int(TEST_TIMESPAN / DT_DMON)
 
 class TestMonitoring(OpenpilotTestCase):
+  # Official policy-math tests: temporarily restore enforcement so this file
+  # still covers upstream behavior. This build's default is the permanent
+  # override, covered by TestPermanentDmDisable.
+  def setup_method(self):
+    self._prev_enforcement_disabled = dm_policy.DM_ENFORCEMENT_DISABLED
+    dm_policy.DM_ENFORCEMENT_DISABLED = False
+
+  def teardown_method(self):
+    dm_policy.DM_ENFORCEMENT_DISABLED = self._prev_enforcement_disabled
+
   def _run_seq(self, msgs, interaction, engaged, lowspeed):
     DM = DriverMonitoring()
     alert_lvls = []
@@ -279,3 +294,133 @@ class TestRunStepEngagement(OpenpilotTestCase):
     dm.run_step(sm, demo=False)
     assert captured['op_engaged'] == expected_op_engaged
     assert captured['driver_engaged'] == expected_driver_engaged
+
+
+PROCESS_CONFIG = Path(__file__).resolve().parents[2] / "system/manager/process_config.py"
+
+
+def _assert_attentive_packet(dat, expect_valid=None, always_on=None):
+  dm = dat.driverMonitoringState
+  assert dm.lockout is False
+  assert dm.lockoutCount == 0
+  assert dm.lockoutMinutesRemaining == 0
+  assert dm.alert3Count == 0
+  assert dm.noResponseCount == 0
+  assert dm.noResponseForceDecel is False
+  assert dm.alwaysOnLockout is False
+  assert dm.alertLevel == log.DriverMonitoringState.AlertLevel.none
+  assert dm.visionPolicyState.awarenessPercent == 100
+  assert dm.visionPolicyState.awarenessStep == 0.
+  assert dm.visionPolicyState.isDistracted is False
+  assert dm.visionPolicyState.distractedTypes.pose is False
+  assert dm.visionPolicyState.distractedTypes.eye is False
+  assert dm.visionPolicyState.distractedTypes.phone is False
+  assert dm.visionPolicyState.distractedTypes.sleep is False
+  assert dm.visionPolicyState.uncertainOffroadAlertPercent == 0
+  assert dm.wheeltouchPolicyState.awarenessPercent == 100
+  assert dm.wheeltouchPolicyState.awarenessStep == 0.
+  if expect_valid is not None:
+    assert dat.valid is expect_valid
+  if always_on is not None:
+    assert dm.alwaysOn is always_on
+
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+OFFICIAL_LIBPARAMS_SHA256 = "19ed8277c634791f4a587caadf5e75f10e0f9229d2e0fbe308ea01d019108c0b"
+OFFICIAL_LIBPARAMS_SIZE = 3038760
+ELF_EM_AARCH64 = 0xB7
+
+
+class TestPermanentDmDisable(OpenpilotTestCase):
+  def setup_method(self):
+    self._prev_enforcement_disabled = dm_policy.DM_ENFORCEMENT_DISABLED
+    dm_policy.DM_ENFORCEMENT_DISABLED = True
+
+  def teardown_method(self):
+    dm_policy.DM_ENFORCEMENT_DISABLED = self._prev_enforcement_disabled
+
+  def test_key_and_ui_removed(self):
+    files = [
+      REPO_ROOT / "openpilot/common/params_keys.h",
+      REPO_ROOT / "openpilot/selfdrive/ui/layouts/settings/toggles.py",
+      REPO_ROOT / "openpilot/selfdrive/ui/mici/layouts/settings/toggles.py",
+      REPO_ROOT / "openpilot/sunnypilot/sunnylink/settings_ui.json",
+      REPO_ROOT / "openpilot/sunnypilot/sunnylink/settings_ui_src/pages/toggles.yaml",
+      REPO_ROOT / "openpilot/selfdrive/monitoring/dmonitoringd.py",
+      REPO_ROOT / "openpilot/selfdrive/monitoring/policy.py",
+    ]
+    for path in files:
+      text = path.read_text()
+      assert "DisableDM" not in text, path
+    assert dm_policy.DM_ENFORCEMENT_DISABLED is True
+
+  def test_libparams_is_official_prebuilt(self):
+    so = REPO_ROOT / "openpilot/common/libparams_c.so"
+    data = so.read_bytes()
+    em = struct.unpack_from("<H", data, 18)[0]
+    if em != ELF_EM_AARCH64:
+      self.skipTest("host stand-in libparams is in place; shipping aarch64 hash is checked after restore")
+    assert len(data) == OFFICIAL_LIBPARAMS_SIZE
+    assert hashlib.sha256(data).hexdigest() == OFFICIAL_LIBPARAMS_SHA256
+    assert b"DisableDM" not in data
+
+  def test_unconditional_attentive_schema_when_distracted(self):
+    DM = DriverMonitoring()
+    for _ in range(int(TEST_TIMESPAN / DT_DMON)):
+      DM._update_states(msg_DISTRACTED, [0, 0, 0], 0, True, False)
+      DM._update_events(False, True, False, 0)
+    assert DM.alert_level == log.DriverMonitoringState.AlertLevel.none
+    assert DM.awareness == 1.
+    assert DM.lockout_active is False
+    assert DM.no_response_cnt == 0
+    dat = DM.get_state_packet(valid=True)
+    _assert_attentive_packet(dat, expect_valid=True)
+    # observation fields stay real; do not fabricate a face
+    assert dat.driverMonitoringState.visionPolicyState.faceDetected is True
+    assert dat.driverMonitoringState.visionPolicyState.isDistracted is False
+
+  def test_invisible_driver_held_attentive(self):
+    DM = DriverMonitoring()
+    for _ in range(int(TEST_TIMESPAN / DT_DMON)):
+      DM._update_states(msg_NO_FACE_DETECTED, [0, 0, 0], 0, True, False)
+      DM._update_events(False, True, False, 0)
+    dat = DM.get_state_packet(valid=True)
+    _assert_attentive_packet(dat, expect_valid=True)
+    assert dat.driverMonitoringState.visionPolicyState.faceDetected is False
+    assert DM.lockout_active is False
+    assert DM.alert_level == log.DriverMonitoringState.AlertLevel.none
+
+  def test_packet_valid_flag_follows_input_health(self):
+    DM = DriverMonitoring()
+    DM._update_states(msg_DISTRACTED, [0, 0, 0], 0, True, False)
+    DM._update_events(False, True, False, 0)
+    assert DM.get_state_packet(valid=True).valid is True
+    dat = DM.get_state_packet(valid=False)
+    assert dat.valid is False
+    _assert_attentive_packet(dat, expect_valid=False)
+
+  def test_always_on_does_not_create_lockout(self):
+    # AlwaysOnDM remains an official setting, but this build still holds enforcement attentive.
+    DM = DriverMonitoring(always_on=True)
+    for _ in range(int(TEST_TIMESPAN / DT_DMON)):
+      DM._update_states(msg_NO_FACE_DETECTED, [0, 0, 0], 0, False, False)
+      DM._update_events(False, False, False, 0)
+    dat = DM.get_state_packet(valid=True)
+    _assert_attentive_packet(dat, expect_valid=True, always_on=True)
+    assert DM.alert_level == log.DriverMonitoringState.AlertLevel.none
+    assert DM.lockout_active is False
+
+  def test_process_config_unchanged(self):
+    text = PROCESS_CONFIG.read_text()
+    assert 'PythonProcess("dmonitoringmodeld", "openpilot.selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),' in text
+    assert 'PythonProcess("dmonitoringd", "openpilot.selfdrive.monitoring.dmonitoringd", driverview, enabled=(WEBCAM or not PC)),' in text
+    assert "DisableDM" not in text
+    src = Path(__file__).resolve().with_name("dmonitoringd.py").read_text()
+    assert "poll='driverStateV2'" in src
+    assert "if not sm.updated['driverStateV2']:" in src
+    assert "valid = sm.all_checks()" in src
+    assert "get_state_packet(valid=valid)" in src
+    assert "Ratekeeper" not in src
+    assert "valid=True" not in src.replace("sm.valid['driverStateV2']", "")
+    assert "DisableDM" not in src

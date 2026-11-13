@@ -14,6 +14,11 @@ from openpilot.common.transformations.camera import DEVICE_CAMERAS
 AlertLevel = log.DriverMonitoringState.AlertLevel
 MonitoringPolicy = log.DriverMonitoringState.MonitoringPolicy
 
+# Permanent for this build: DM enforcement is held attentive (no DM
+# distraction alerts, lockout, or force-decel). Official monitoring is
+# restored by setting this False and building again.
+DM_ENFORCEMENT_DISABLED = True
+
 def to_percent(v):
   return int(min(max(v * 100., 0.), 100.))
 
@@ -177,6 +182,16 @@ class DriverMonitoring:
     self.last_vision_awareness = 1.
     self.last_wheeltouch_awareness = 1.
 
+  def _hold_disabled_state(self):
+    self.alert_level = AlertLevel.none
+    self.lockout_active = False
+    self.lockout_time_elapsed = 0
+    self.alert_3_cnt = 0
+    self.cnt_since_alert_3 = 0
+    self.no_response_cnt = 0
+    self.dcam_uncertain_cnt = 0
+    self._reset_awareness()
+
   def _set_policy(self, target_policy):
     if self.active_policy == MonitoringPolicy.vision and self.awareness <= self.threshold_alert_2:
       if target_policy == MonitoringPolicy.vision:
@@ -315,6 +330,10 @@ class DriverMonitoring:
     self.alert_level = AlertLevel.none
     self.driver_interacting = driver_engaged
 
+    if DM_ENFORCEMENT_DISABLED:
+      self._hold_disabled_state()
+      return
+
     if self.alert_3_cnt >= self.settings._MAX_ALERT_3 or self.no_response_cnt >= self.settings._MAX_NO_RESPONSE:
       if not self.lockout_active:
         self.lockout_count += 1
@@ -426,6 +445,26 @@ class DriverMonitoring:
     dm.wheeltouchPolicyState.awarenessPercent = to_percent(self.last_wheeltouch_awareness if self.active_policy == MonitoringPolicy.vision else self.awareness)
     dm.wheeltouchPolicyState.awarenessStep = 0. if self.active_policy == MonitoringPolicy.vision else self.step_change
     dm.wheeltouchPolicyState.driverInteracting = self.driver_interacting
+
+    if DM_ENFORCEMENT_DISABLED:
+      dm.lockout = False
+      dm.lockoutCount = 0
+      dm.lockoutMinutesRemaining = 0
+      dm.alert3Count = 0
+      dm.noResponseCount = 0
+      dm.noResponseForceDecel = False
+      dm.alwaysOnLockout = False
+      dm.alertLevel = AlertLevel.none
+      dm.visionPolicyState.awarenessPercent = 100
+      dm.visionPolicyState.awarenessStep = 0.
+      dm.visionPolicyState.isDistracted = False
+      dm.visionPolicyState.distractedTypes.pose = False
+      dm.visionPolicyState.distractedTypes.eye = False
+      dm.visionPolicyState.distractedTypes.phone = False
+      dm.visionPolicyState.distractedTypes.sleep = False
+      dm.visionPolicyState.uncertainOffroadAlertPercent = 0
+      dm.wheeltouchPolicyState.awarenessPercent = 100
+      dm.wheeltouchPolicyState.awarenessStep = 0.
     return dat
 
   def run_step(self, sm, demo=False):
