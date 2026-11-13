@@ -19,6 +19,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import Lon
 from openpilot.sunnypilot.selfdrive.car.always_chill import ALWAYS_CHILL, experimental_mode_active
 from openpilot.sunnypilot.selfdrive.car.chill_aggressive import ChillAggressiveLaunch
 from openpilot.sunnypilot.selfdrive.car import chill_relaxed
+from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_launch import LeadLaunch, LAUNCH_JERK_UP
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -87,6 +88,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.output_a_target = init_a
     self.output_should_stop = False
     self.chill_aggressive_launch = ChillAggressiveLaunch()
+    self.lead_launch = LeadLaunch()
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
     self.a_desired_trajectory = np.zeros(CONTROL_N)
@@ -180,6 +182,20 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.output_should_stop = any(s for _, _, s in candidates)
 
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, cap)
+
+    # Comfortable launch take-up (test2 LaunchStart + predictive go /
+    # preview). Caps are this branch's C3X personality ceilings, including
+    # the Aggressive +0.4 launch boost. A stopped lead never triggers go.
+    if reset_state:
+      self.lead_launch.reset(float(self.output_a_target))
+    else:
+      a_ls, ss = self.lead_launch.apply(
+        float(self.output_a_target), self.output_should_stop,
+        v_ego, v_cruise, sm['radarState'].leadOne, self.fcw, self.dt,
+        cap=cap, jerk_up=LAUNCH_JERK_UP,
+        v_ego_stopping=getattr(self.CP, "vEgoStopping", 0.25))
+      self.output_a_target = float(np.clip(a_ls, ACCEL_MIN, cap))
+      self.output_should_stop = ss
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 
