@@ -3,7 +3,7 @@
 
 usage: test3_c3x_equiv_sim.py REPO [BUILD_DIR]
 Prints one JSON object. Run on this official-dev rebuild and compare to the old test3 / C3X JSONs.
-Accel caps use this tree's stock (2.0); T_FOLLOW and stop extras match C3X. experimental_mode is always False (Chill). Not road-tested.
+Accel caps are pinned to the C3X / old-test3 curve (Standard 1.6/1.2/0.8/0.6); T_FOLLOW and stop extras match C3X. experimental_mode is always False (Chill). Not road-tested.
 """
 from __future__ import annotations
 
@@ -207,7 +207,7 @@ def _plan(mpc, ev, plan_a, v_des, rs, v_cruise, personality, exp_mode, cap, dt_m
 
   Official sunnypilot/dev removed the cruise obstacle from the MPC;
   set-speed tracking is get_cruise_accel, and the plan is min(lead-MPC,
-  cruise). `cap` is the personality cruise ceiling (2.0 stock, 1.6 Relaxed).
+  cruise). `cap` is the personality cruise ceiling (C3X stock curve, Relaxed 80%).
   """
   import numpy as np
   from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
@@ -429,8 +429,9 @@ def main():
     "sims": {k: {kk: (None if vv is None else (float(vv) if isinstance(vv, (int, float, np.floating)) else vv))
                  for kk, vv in v.items()} for k, v in sims.items()},
     "STOP_DISTANCE": STOP_DISTANCE,
-    "stock_cruise_cap": ACCEL_MAX,
-    "note": "Standard stock is this tree's official ACCEL_MAX=2.0 (flat); Relaxed is 0.8 of that. C3X used [1.6,1.2,0.8,0.6]. No cruise obstacle; _plan uses get_cruise_accel.",
+    "stock_cruise_cap": "C3X curve [1.6,1.2,0.8,0.6] at [0,10,25,40] (official unpatched ACCEL_MAX still 2.0)",
+    "official_ACCEL_MAX": ACCEL_MAX,
+    "note": "Standard is pinned to the C3X / old-test3 stock curve; Relaxed is 80% of that; Aggressive is the curve plus +0.4 launch. Official unpatched stock remains ACCEL_MAX=2.0. No cruise obstacle; _plan uses get_cruise_accel.",
   }
   print(json.dumps(out, indent=2, default=float))
 

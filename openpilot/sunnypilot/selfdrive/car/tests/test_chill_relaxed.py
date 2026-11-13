@@ -34,15 +34,14 @@ def test_jerk_and_accel():
   assert get_jerk_factor(P.relaxed, True) == 1.0
   assert get_jerk_factor(P.standard, False) == 1.0
   assert get_jerk_factor(P.aggressive, False) == 0.5
-  # This tree's official stock is ACCEL_MAX = 2.0 (flat). Relaxed is 80% of
-  # that (1.6). C3X/old test3 used the [1.6, 1.2, 0.8, 0.6] curve, so
-  # Relaxed was 1.28 / 0.64 / 0.48 at 0 / 25 / 40 m/s and Standard was 1.6 at 0.
+  # This branch pins Standard to the C3X stock curve; Relaxed is 80% of it.
+  # Official unpatched sunnypilot/dev is still a flat ACCEL_MAX = 2.0.
   assert ACCEL_MAX == pytest.approx(2.0)
-  assert get_max_accel(0., chill_relaxed_mode=True) == pytest.approx(1.6)
-  assert get_max_accel(25., chill_relaxed_mode=True) == pytest.approx(1.6)
-  assert get_max_accel(40., chill_relaxed_mode=True) == pytest.approx(1.6)
-  assert get_max_accel(0.) == pytest.approx(2.0)
-  assert get_max_accel(25.) == pytest.approx(2.0)
+  assert get_max_accel(0., chill_relaxed_mode=True) == pytest.approx(1.28)
+  assert get_max_accel(25., chill_relaxed_mode=True) == pytest.approx(0.64)
+  assert get_max_accel(40., chill_relaxed_mode=True) == pytest.approx(0.48)
+  assert get_max_accel(0.) == pytest.approx(1.6)
+  assert get_max_accel(25.) == pytest.approx(0.8)
 
 
 def test_standstill_gaps_unchanged():

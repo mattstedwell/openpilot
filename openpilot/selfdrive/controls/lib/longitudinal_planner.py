@@ -35,18 +35,23 @@ def get_cruise_accel(v_cruise, v_ego, a_cruise_prev, dt, cap=None):
   return target_accel
 
 
-def get_max_accel(v_ego, chill_aggressive_launch=False, chill_relaxed_mode=False):
-  """Cruise accel ceiling for this tree.
+# C3X / old test3 cruise accel curve. Official sunnypilot/dev stock is a
+# flat ACCEL_MAX = 2.0; this branch pins Standard to the C3X numbers.
+A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
+A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
 
-  Official sunnypilot/dev stock is a flat ACCEL_MAX = 2.0 (plus the
-  official get_cruise_accel jerk schedule), not the older speed-dependent
-  [1.6, 1.2, 0.8, 0.6] curve. 'Standard stock' is that 2.0. Chill +
-  Relaxed is 80% of it (1.6). Chill + Aggressive launch adds +0.4 at a
-  stop, tapering out by 10 m/s, then clips at ACCEL_MAX — so on this
-  tree the launch boost cannot exceed official 2.0 and is a no-op at
-  the actuator. Report numbers against the C3X/old-test3 curve honestly.
+
+def get_max_accel(v_ego, chill_aggressive_launch=False, chill_relaxed_mode=False):
+  """Cruise accel ceiling: C3X / old test3 numbers.
+
+  Standard is the C3X stock curve [1.6, 1.2, 0.8, 0.6] at [0, 10, 25, 40] m/s,
+  not this tree's official flat ACCEL_MAX=2.0. Chill + Relaxed is 80% of
+  that curve (1.28 / 0.64 / 0.48 at 0 / 25 / 40 m/s). Chill + Aggressive
+  launch adds +0.4 at a stop, tapering out by 10 m/s (~22 mph): 2.0 at a
+  stop, 1.6 at 5 m/s, 1.2 at 10 m/s. The boost is no longer a no-op.
+  Applied as a cap on get_cruise_accel and on the chosen plan.
   """
-  stock = float(ACCEL_MAX)
+  stock = float(np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS))
   if chill_relaxed_mode:
     return stock * chill_relaxed.MAX_ACCEL_SCALE
   extra = ChillAggressiveLaunch.accel_extra(v_ego) if chill_aggressive_launch else 0.0

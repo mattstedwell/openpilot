@@ -10,19 +10,23 @@ from openpilot.sunnypilot.selfdrive.car.chill_aggressive import ChillAggressiveL
 
 
 def test_launch_accel_curve():
-  # Official stock is a flat 2.0. Launch is stock + 0.4*(1-v/10), clipped
-  # at ACCEL_MAX, so the boost is a no-op at the actuator on this tree.
-  # C3X: 2.0 at 0 (1.6+0.4), 1.6 at 5, 1.2 at 10, and stock 1.6 / 0.8 at 0 / 25.
+  # C3X / old test3: Standard is the [1.6, 1.2, 0.8, 0.6] curve; launch is
+  # that curve + 0.4*(1-v/10), so 2.0 at a stop, 1.6 at 5 m/s, 1.2 at 10 m/s.
+  # The boost is no longer a no-op (it was when Standard was a flat 2.0).
   assert ACCEL_MAX == pytest.approx(2.0)
   assert ChillAggressiveLaunch.accel_extra(0.) == pytest.approx(0.4)
   assert ChillAggressiveLaunch.accel_extra(5.) == pytest.approx(0.2)
   assert ChillAggressiveLaunch.accel_extra(10.) == 0.
   assert get_max_accel(0., True) == pytest.approx(2.0)
-  assert get_max_accel(5., True) == pytest.approx(2.0)
-  assert get_max_accel(10., True) == pytest.approx(2.0)
-  for speed in np.linspace(0., 45., 40):
+  assert get_max_accel(5., True) == pytest.approx(1.6)
+  assert get_max_accel(10., True) == pytest.approx(1.2)
+  for speed in np.linspace(10., 45., 30):
     assert get_max_accel(speed, True) == pytest.approx(get_max_accel(speed))
-    assert get_max_accel(speed) == pytest.approx(2.0)
+  assert get_max_accel(0.) == pytest.approx(1.6)
+  assert get_max_accel(25.) == pytest.approx(0.8)
+  # Below 10 m/s, launch sits above Standard.
+  assert get_max_accel(0., True) > get_max_accel(0.)
+  assert get_max_accel(5., True) > get_max_accel(5.)
 
 
 def test_get_cruise_accel_respects_personality_cap():

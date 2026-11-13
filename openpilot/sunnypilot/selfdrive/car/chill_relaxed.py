@@ -3,7 +3,7 @@
 Relaxed is the highway profile. In Chill mode (Experimental Mode off) it
 follows farther back at speed, accelerates more gently, and smooths its
 accel changes. Standard, Aggressive, and Experimental Mode are unchanged
-relative to this tree's official stock.
+relative to the C3X / old-test3 stock accel curve this branch pins.
 """
 import numpy as np
 
@@ -13,7 +13,7 @@ from openpilot.cereal import log
 # so stop-and-go stays as before and the highway gap grows by ~0.4 s.
 T_FOLLOW_BP = [13.4, 22.4]  # m/s (~30 mph, ~50 mph)
 T_FOLLOW_V = [1.75, 2.15]   # s
-# Fraction of this tree's official cruise accel ceiling (ACCEL_MAX = 2.0).
+# Fraction of the C3X / old-test3 stock curve this branch uses for Standard.
 MAX_ACCEL_SCALE = 0.8
 # Multiplies the jerk/accel-change costs (stock Relaxed is 1.0).
 JERK_FACTOR = 1.3
