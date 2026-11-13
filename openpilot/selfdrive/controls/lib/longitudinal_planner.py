@@ -19,7 +19,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import Lon
 from openpilot.sunnypilot.selfdrive.car.always_chill import ALWAYS_CHILL, experimental_mode_active
 from openpilot.sunnypilot.selfdrive.car.chill_aggressive import ChillAggressiveLaunch
 from openpilot.sunnypilot.selfdrive.car import chill_relaxed
-from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_launch import LeadLaunch, LAUNCH_JERK_UP
+from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_launch import (
+  LeadLaunch, LAUNCH_JERK_UP, desired_follow_gap)
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -189,11 +190,15 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     if reset_state:
       self.lead_launch.reset(float(self.output_a_target))
     else:
+      lead_one = sm['radarState'].leadOne
+      v_lead = getattr(lead_one, 'vLead', float('nan'))
+      desired = desired_follow_gap(v_ego, v_lead, personality, exp_mode)
       a_ls, ss = self.lead_launch.apply(
         float(self.output_a_target), self.output_should_stop,
-        v_ego, v_cruise, sm['radarState'].leadOne, self.fcw, self.dt,
+        v_ego, v_cruise, lead_one, self.fcw, self.dt,
         cap=cap, jerk_up=LAUNCH_JERK_UP,
-        v_ego_stopping=getattr(self.CP, "vEgoStopping", 0.25))
+        v_ego_stopping=getattr(self.CP, "vEgoStopping", 0.25),
+        desired_gap=desired)
       self.output_a_target = float(np.clip(a_ls, ACCEL_MIN, cap))
       self.output_should_stop = ss
 

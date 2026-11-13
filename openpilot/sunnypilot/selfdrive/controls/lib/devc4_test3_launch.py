@@ -25,7 +25,10 @@ When a lead is present and ego is stopped or under ~10 mph:
     the chosen plan. FCW, urgent braking, or a gap under 3.5 m also
     hard-release.
   * The path is inactive above ~10 mph (jerk-limited hand-off);
-    launch_go is false for a new engagement above that window.
+    launch_go is false for a new engagement above that window, and
+    already_active cannot keep it on past ~11 mph. Take-up also
+    hands back to the MPC the moment the bumper gap falls below
+    the desired follow (T*v + STOP + blended extra).
 
 A 0.25 s time-to-roll (plant v > 0.05 m/s) is not comfortably
 reachable: the host plant tau is 0.25 s and Toyota's actuator delay
@@ -49,6 +52,12 @@ LAUNCH_JERK_UP = 0.40             # m/s³; lead-launch ramp
 LAUNCH_GO_V_LEAD = 0.10           # m/s; lead must be clearly moving (~0.22 mph)
 LAUNCH_GO_PULL_AWAY = 0.05        # m/s; v_lead - v_ego, gap growing
 LAUNCH_GO_V_EGO_MAX = 4.5         # m/s (~10 mph)
+# already_active may hold a little past 10 mph so the hand-off does
+# not flicker, but must NEVER stay in take-up at city speeds. The
+# previous already_active branch ignored v_ego entirely and stayed
+# on through 25-30 mph, ramping to the personality cap and closing
+# the gap well below the MPC desired follow (and the standstill gap).
+LAUNCH_GO_V_EGO_HOLD = 5.0        # m/s (~11.2 mph); already_active ceiling
 LAUNCH_GO_MIN_GAP = 3.5           # m; safety floor (independent of stop extras)
 LAUNCH_GO_V_CRUISE = 0.5          # m/s; no-lead set-speed margin
 LAUNCH_GO_CONFIRM = 2             # planner frames of go before the 0.30 step
@@ -122,7 +131,8 @@ def launch_go(present, d_rel, v_lead, v_ego, v_cruise, fcw=False,
     pulling = v_lead > LAUNCH_GO_V_LEAD and v_lead >= v_ego + LAUNCH_GO_PULL_AWAY
     if (pulling or departing) and v_ego <= LAUNCH_GO_V_EGO_MAX:
       return True
-    if already_active and v_lead > LAUNCH_GO_V_LEAD and v_lead >= v_ego - LAUNCH_GO_CATCH:
+    if (already_active and v_ego <= LAUNCH_GO_V_EGO_HOLD
+        and v_lead > LAUNCH_GO_V_LEAD and v_lead >= v_ego - LAUNCH_GO_CATCH):
       return True
     return False
   if not (_finite(v_ego, v_cruise)):
@@ -263,6 +273,26 @@ class LaunchStart:
     return float(a)
 
 
+def desired_follow_gap(v_ego, v_lead, personality, experimental_mode=False) -> float:
+  """Equal-speed desired bumper gap, meters: T_FOLLOW*v + STOP + the
+  blended stop-extra. This is what the MPC comfort cost tracks at
+  matched speeds (the v²/(2a) terms cancel). Used to gate take-up
+  so it cannot close the gap below the lead plan."""
+  from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
+    STOP_DISTANCE, LEAD_STOP_V_FULL, LEAD_STOP_V_NONE,
+    get_T_FOLLOW, get_lead_stop_extra,
+  )
+  v = max(float(v_ego), 0.0) if _finite(v_ego) else 0.0
+  T = get_T_FOLLOW(personality, experimental_mode, v)
+  extra = get_lead_stop_extra(personality, experimental_mode)
+  if _finite(v_lead):
+    blended = float(np.interp(float(v_lead), [LEAD_STOP_V_FULL, LEAD_STOP_V_NONE],
+                              [extra, 0.0]))
+  else:
+    blended = 0.0
+  return float(T * v + STOP_DISTANCE + blended)
+
+
 class LeadLaunch:
   """Planner-side state: LaunchStart take-up only (no LeadDecel)."""
 
@@ -273,7 +303,8 @@ class LeadLaunch:
     self.launch.reset(a)
 
   def apply(self, a_chosen, should_stop, v_ego, v_cruise, lead, fcw, dt,
-            cap=float("inf"), jerk_up=LAUNCH_JERK_UP, v_ego_stopping=0.25):
+            cap=float("inf"), jerk_up=LAUNCH_JERK_UP, v_ego_stopping=0.25,
+            desired_gap=None):
     present = _lead_present(lead)
     d_rel = getattr(lead, "dRel", float("nan")) if present else float("nan")
     v_lead = getattr(lead, "vLead", float("nan")) if present else float("nan")
@@ -284,6 +315,13 @@ class LeadLaunch:
     go = launch_go(present, d_rel, v_lead, v_ego, v_cruise, fcw=fcw,
                    already_active=self.launch.active,
                    a_lead=a_lead if present else None)
+    # Never close the gap below the MPC desired follow: hand back to
+    # the chosen (MPC) plan. go=False + active uses the soft-exit
+    # path, which ramps toward a_chosen (not toward the cap). This is
+    # the bypass fix — take-up may still ramp to cap while the gap is
+    # at or above desired (the comfortable first step from a stop).
+    if present and _finite(d_rel, desired_gap) and d_rel < desired_gap:
+      go = False
     a = self.launch.update(go, a_chosen, cap, jerk_up, dt,
                            v_ego=v_ego, v_lead=v_lead if present else None,
                            a_lead=a_lead if present else None, hard=hard)

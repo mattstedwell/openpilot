@@ -16,6 +16,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_launch import (
   LaunchStart, LeadLaunch, launch_go, launch_hard, _lead_departing,
   LAUNCH_START_STEP, LAUNCH_JERK_UP, LAUNCH_GO_CONFIRM, LAUNCH_GO_V_EGO_MAX,
   LAUNCH_GO_MIN_GAP, LAUNCH_PREVIEW, LAUNCH_GO_A_LEAD, DT, MPH,
+  LAUNCH_GO_V_EGO_HOLD, desired_follow_gap,
 )
 from openpilot.selfdrive.controls.lib.longitudinal_planner import get_max_accel
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_lead_stop_extra
@@ -301,3 +302,46 @@ def test_stop_extras_and_gaps_unchanged():
   assert get_lead_stop_extra(P.standard, False) == pytest.approx(5 * FT)
   assert get_lead_stop_extra(P.aggressive, False) == pytest.approx(5 * FT)
   assert get_lead_stop_extra(P.aggressive, True) == 0.0
+
+
+def test_already_active_does_not_stay_on_at_city_speeds():
+  """The bypass bug: already_active ignored v_ego and stayed in
+  take-up through 25-30 mph, ramping to cap and closing the gap."""
+  for v in (15 * MPH, 25 * MPH, 30 * MPH, 12.0):
+    assert launch_go(True, 20.0, v, v, 25 * MPH, already_active=True) is False
+  # A little past 10 mph may still hold (hysteresis, 11.2 mph ceiling).
+  v_hold = LAUNCH_GO_V_EGO_MAX + 0.2  # 4.7 m/s, under 5.0 hold
+  assert v_hold < LAUNCH_GO_V_EGO_HOLD
+  assert launch_go(True, 20.0, v_hold + 0.1, v_hold, 25 * MPH, already_active=True) is True
+  assert launch_go(True, 20.0, LAUNCH_GO_V_EGO_HOLD + 0.2,
+                   LAUNCH_GO_V_EGO_HOLD + 0.1, 25 * MPH, already_active=True) is False
+
+
+def test_desired_gap_gate_hands_back_to_mpc():
+  """Take-up must not keep ramping to cap once the gap is below desired."""
+  ls = LeadLaunch()
+  lead = _Lead(d=10.0, v=1.0, a=0.5)
+  ls.apply(-0.5, True, 0.0, 25 * MPH, lead, False, DT, cap=1.6, desired_gap=8.0)
+  ls.apply(-0.5, True, 0.0, 25 * MPH, lead, False, DT, cap=1.6, desired_gap=8.0)
+  assert ls.launch.active is True
+  lead = _Lead(d=8.0, v=2.0, a=0.5)
+  a, ss = ls.apply(-0.1, False, 1.0, 25 * MPH, lead, False, DT, cap=1.6,
+                   desired_gap=12.0)
+  # Not ramping toward 1.6.
+  assert a < 1.0
+  for _ in range(30):
+    a, ss = ls.apply(-0.1, False, 2.0, 25 * MPH, lead, False, DT, cap=1.6,
+                     desired_gap=12.0)
+  assert a == pytest.approx(-0.1, abs=0.05)
+  assert a < 0.5
+
+
+def test_desired_follow_gap_is_t_v_plus_stop():
+  """Agg Chill T is 1.25; at 30 mph extras are blended out."""
+  v = 30 * MPH
+  d = desired_follow_gap(v, v, P.aggressive, False)
+  assert d == pytest.approx(1.25 * v + 6.0)
+  assert d / FT == pytest.approx(74.7, abs=0.2)
+  # Standstill is the planned stop gap (STOP + 5 ft).
+  assert desired_follow_gap(0.0, 0.0, P.aggressive, False) == pytest.approx(7.524)
+  assert desired_follow_gap(0.0, 0.0, P.relaxed, False) == pytest.approx(9.048)
