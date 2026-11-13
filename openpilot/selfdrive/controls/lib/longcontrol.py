@@ -4,6 +4,7 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
 from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_final_stop import stopping_accel_step
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
@@ -66,9 +67,16 @@ class LongControl:
     elif self.long_control_state == LongCtrlState.stopping:
       output_accel = self.last_output_accel
       if output_accel > self.CP.stopAccel:
-        output_accel = min(output_accel, 0.0)
-        # TODO: can we just go straight to stopAccel?
-        output_accel -= 1.0 * DT_CTRL  # m/s^2/s while trying to stop
+        # Rolling: follow the chauffeur envelope (near-zero at v≈0);
+        # do not grab toward stopAccel while still moving. After
+        # standstill, ramp to stopAccel at 0.30 m/s²/s so hold
+        # pressure does not snap on. Urgent (<= -1.5) is never weakened.
+        # Official sunnypilot/dev builds toward stopAccel at 1.0 m/s²/s
+        # while still rolling — that is the final-stop lurch from 1 mph
+        # to 0 and into the hold on a 2021 Highlander Hybrid.
+        output_accel = stopping_accel_step(
+          output_accel, CS.standstill, DT_CTRL, CS.vEgo,
+          stop_accel=self.CP.stopAccel)
       self.reset()
 
     else:  # LongCtrlState.pid
