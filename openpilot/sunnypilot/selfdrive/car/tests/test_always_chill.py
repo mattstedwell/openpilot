@@ -116,7 +116,9 @@ def test_planner_uses_acc_only_when_always_chill():
   i_chill = src.index("if ALWAYS_CHILL:")
   i_else = src.index("else:", i_chill)
   chill = src[i_chill:i_else]
-  official = src[i_else:src.index("self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)")]
+  # Official 3-way blend is the else of ALWAYS_CHILL; the personality
+  # cap clip (this tree's stock ACCEL_MAX, Relaxed 80%, etc.) follows it.
+  official = src[i_else:src.index("self.output_a_target = np.clip(output_a_target, ACCEL_MIN, cap)")]
   assert "choose_acc_plan(" in chill
   assert "output_a_target_e2e" not in chill
   assert "LongitudinalPlanSource.e2e" not in chill
