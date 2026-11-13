@@ -20,6 +20,9 @@ from openpilot.sunnypilot.selfdrive.car.always_chill import ALWAYS_CHILL, experi
 from openpilot.sunnypilot.selfdrive.car.chill_aggressive import ChillAggressiveLaunch
 from openpilot.sunnypilot.selfdrive.car import chill_relaxed
 from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_launch import LeadLaunch, LAUNCH_JERK_UP
+from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_min_gap import (
+  get_min_gap_floor, desired_bumper_gap, apply_min_gap_floor)
+from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_final_stop import FinalStopTaper, FINAL_STOP_MIN_GAP
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -89,6 +92,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.output_should_stop = False
     self.chill_aggressive_launch = ChillAggressiveLaunch()
     self.lead_launch = LeadLaunch()
+    self.final_stop = FinalStopTaper()
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
     self.a_desired_trajectory = np.zeros(CONTROL_N)
@@ -119,6 +123,17 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     launch_boost = self.chill_aggressive_launch.update(
       enabled, exp_mode, personality,
       v_ego, v_cruise if v_cruise_initialized else 0., sm['carState'].brakePressed)
+    # Agg +0.4 launch boost is gated on gap >= desired, so the extra
+    # cap cannot close a short follow. Desired and the standstill
+    # floor are reused below for launch and the post-plan safety check.
+    lead_one = sm['radarState'].leadOne
+    lead_present = bool(getattr(lead_one, 'present', False) or getattr(lead_one, 'status', False))
+    d_rel = float(getattr(lead_one, 'dRel', float('nan'))) if lead_present else float('nan')
+    v_lead = float(getattr(lead_one, 'vLead', float('nan'))) if lead_present else float('nan')
+    desired_gap = desired_bumper_gap(v_ego, v_lead, personality, exp_mode)
+    min_gap_floor = get_min_gap_floor(personality, exp_mode)
+    if lead_present and np.isfinite(d_rel) and d_rel < desired_gap:
+      launch_boost = False
     chill_relaxed_mode = chill_relaxed.is_chill_relaxed(exp_mode, personality)
     cap = get_max_accel(v_ego, launch_boost, chill_relaxed_mode)
 
@@ -188,13 +203,31 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # the Aggressive +0.4 launch boost. A stopped lead never triggers go.
     if reset_state:
       self.lead_launch.reset(float(self.output_a_target))
+      self.final_stop.reset(float(self.output_a_target))
     else:
       a_ls, ss = self.lead_launch.apply(
         float(self.output_a_target), self.output_should_stop,
         v_ego, v_cruise, sm['radarState'].leadOne, self.fcw, self.dt,
         cap=cap, jerk_up=LAUNCH_JERK_UP,
+        v_ego_stopping=getattr(self.CP, "vEgoStopping", 0.25),
+        desired_gap=desired_gap, min_gap_floor=min_gap_floor)
+      # Chauffeur last-5-mph taper and 5-8 mph command freeze.
+      # Urgent / FCW / close-gap / launch (positive) pass through.
+      # Urgent passthrough is FCW / TTC<2 s / critically close (3.5 m),
+      # not the 24.69 ft floor — a normal approach to the standstill
+      # gap must still get the chauffeur taper. The floor hook below
+      # is the hard safety net.
+      a_fs = self.final_stop.apply(
+        float(a_ls), v_ego, sm['radarState'].leadOne, self.fcw, self.dt,
+        should_stop=bool(ss), a_prev=a_prev, min_gap=FINAL_STOP_MIN_GAP)
+      # Hard min-gap floor LAST: never command +accel inside the
+      # planned standstill gap; brake to restore. Wins over launch
+      # and the taper so those hooks cannot close below the floor.
+      a_out, ss, _ = apply_min_gap_floor(
+        a_fs, ss, d_rel, v_ego, v_lead, a_prev, min_gap_floor, self.dt,
+        fcw=self.fcw, accel_min=ACCEL_MIN,
         v_ego_stopping=getattr(self.CP, "vEgoStopping", 0.25))
-      self.output_a_target = float(np.clip(a_ls, ACCEL_MIN, cap))
+      self.output_a_target = float(np.clip(a_out, ACCEL_MIN, cap))
       self.output_should_stop = ss
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0

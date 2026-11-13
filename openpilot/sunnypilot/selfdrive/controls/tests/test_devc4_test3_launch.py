@@ -16,6 +16,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_launch import (
   LaunchStart, LeadLaunch, launch_go, launch_hard, _lead_departing,
   LAUNCH_START_STEP, LAUNCH_JERK_UP, LAUNCH_GO_CONFIRM, LAUNCH_GO_V_EGO_MAX,
   LAUNCH_GO_MIN_GAP, LAUNCH_PREVIEW, LAUNCH_GO_A_LEAD, DT, MPH,
+  LAUNCH_GO_V_EGO_HOLD,
 )
 from openpilot.selfdrive.controls.lib.longitudinal_planner import get_max_accel
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_lead_stop_extra
@@ -301,3 +302,56 @@ def test_stop_extras_and_gaps_unchanged():
   assert get_lead_stop_extra(P.standard, False) == pytest.approx(5 * FT)
   assert get_lead_stop_extra(P.aggressive, False) == pytest.approx(5 * FT)
   assert get_lead_stop_extra(P.aggressive, True) == 0.0
+
+
+def test_already_active_does_not_stay_on_at_city_speeds():
+  """The bug Matt felt: already_active ignored v_ego and stayed in
+  take-up through 25-30 mph, ramping to cap and closing the gap."""
+  # New engagement above 10 mph is already False (existing test).
+  # already_active at 15 / 25 / 30 mph must also be False, even when
+  # the lead is matching us (the old CATCH hysteresis).
+  for v in (15 * MPH, 25 * MPH, 30 * MPH, 12.0):
+    assert launch_go(True, 20.0, v, v, 25 * MPH, already_active=True) is False
+  # A little past 10 mph may still hold (hysteresis, 11.2 mph ceiling).
+  v_hold = LAUNCH_GO_V_EGO_MAX + 0.2  # 4.7 m/s, under 5.0 hold
+  assert v_hold < LAUNCH_GO_V_EGO_HOLD
+  assert launch_go(True, 20.0, v_hold + 0.1, v_hold, 25 * MPH, already_active=True) is True
+  # At the ceiling, no.
+  assert launch_go(True, 20.0, LAUNCH_GO_V_EGO_HOLD + 0.2,
+                   LAUNCH_GO_V_EGO_HOLD + 0.1, 25 * MPH, already_active=True) is False
+
+
+def test_desired_gap_gate_hands_back_to_mpc():
+  """Take-up must not keep ramping to cap once the gap is below desired."""
+  ls = LeadLaunch()
+  # Establish an active launch at a comfortable gap.
+  lead = _Lead(d=10.0, v=1.0, a=0.5)
+  ls.apply(-0.5, True, 0.0, 25 * MPH, lead, False, DT, cap=1.6, desired_gap=8.0)
+  ls.apply(-0.5, True, 0.0, 25 * MPH, lead, False, DT, cap=1.6, desired_gap=8.0)
+  assert ls.launch.active is True
+  # Now the gap is below desired: go is forced off, we must not
+  # command the cap. Soft-exit / handoff toward the chosen plan.
+  lead = _Lead(d=8.0, v=2.0, a=0.5)
+  a, ss = ls.apply(-0.1, False, 1.0, 25 * MPH, lead, False, DT, cap=1.6,
+                   desired_gap=12.0)
+  # Not ramping toward 1.6.
+  assert a <= 0.30 + 1e-6 or a <= 0.0  # handed toward chosen (-0.1) or at most the step
+  # After a few frames we should be at or near the chosen plan, not the cap.
+  for _ in range(30):
+    a, ss = ls.apply(-0.1, False, 2.0, 25 * MPH, lead, False, DT, cap=1.6,
+                     desired_gap=12.0)
+  assert a == pytest.approx(-0.1, abs=0.05)
+  assert a < 0.5  # definitely not the 1.6 cap
+
+
+def test_floor_is_hard_release():
+  ls = LeadLaunch()
+  lead = _Lead(d=10.0, v=1.0, a=0.5)
+  ls.apply(-0.5, True, 0.0, 25 * MPH, lead, False, DT, cap=1.6, min_gap_floor=7.524)
+  ls.apply(-0.5, True, 0.0, 25 * MPH, lead, False, DT, cap=1.6, min_gap_floor=7.524)
+  assert ls.launch.active is True
+  lead = _Lead(d=5.0, v=1.0, a=0.5)  # inside 24.69 ft floor
+  a, ss = ls.apply(-0.8, False, 1.0, 25 * MPH, lead, False, DT, cap=1.6,
+                   min_gap_floor=7.524)
+  assert a == pytest.approx(-0.8)  # hard release: raw chosen plan
+  assert ls.launch.active is False

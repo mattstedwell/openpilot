@@ -26,7 +26,7 @@ def test_t_follow():
   for v in (0., 30.):
     assert get_T_FOLLOW(P.relaxed, True, v) == 1.75
     assert get_T_FOLLOW(P.standard, False, v) == 1.45
-    assert get_T_FOLLOW(P.aggressive, False, v) == 1.25
+    assert get_T_FOLLOW(P.aggressive, False, v) == 1.5
 
 
 def test_jerk_and_accel():
