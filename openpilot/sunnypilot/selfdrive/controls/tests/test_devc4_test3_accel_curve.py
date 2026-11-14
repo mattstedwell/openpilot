@@ -94,7 +94,7 @@ def test_rise_limit_only_on_increase():
 def test_planner_wiring_tripwire():
   src = PLANNER.read_text()
   i = src.find("self.output_a_target = np.clip(output_a_target, ACCEL_MIN, cap)")
-  j = src.find("limit_accel_rise(self.output_a_target, a_prev, v_ego, self.dt)")
+  j = src.find("limit_accel_rise(self.output_a_target, a_prev, v_ego, self.dt")
   assert 0 < i < j
   assert "is_chill_aggressive(exp_mode, personality)" in src
   assert "ChillAggressiveLaunch" not in src  # no launch boost / take-up in the planner

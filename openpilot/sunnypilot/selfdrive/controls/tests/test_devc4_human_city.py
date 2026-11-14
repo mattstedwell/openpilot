@@ -320,7 +320,7 @@ def test_launch_build_human_start_and_accel(sims):
   for p in PERS:
     for name in ("signal_queue_40mph", "launch_to35mph", "accordion_0_15mph"):
       r = sims[("launch", p)][name]
-      assert r["t_move_mean"] <= 1.15, (p, name)       # human ~1.04-1.08 s
+      assert r["t_move_mean"] <= 0.90, (p, name)       # launch075 target ~0.75 s (t361u)
       assert r["peak_accel"] <= HC.human_launch_cap(0.0, p) + 0.05
 
 
@@ -341,3 +341,105 @@ def test_release_prev_accel_only_releases_standstill_hold():
   assert release_prev_accel(-2.0, 0.5, 0.0, False, True) == -2.0
   # not long active: untouched
   assert release_prev_accel(-2.0, 0.5, 0.0, True, False) == -2.0
+
+
+# --- launch075 (t361u: start ~0.75 s after the lead; firm, fast lead response) -------
+def _lead(d, v, a=0.0):
+  return SimpleNamespace(status=True, present=True, dRel=d, vLead=v, vLeadK=v, aLeadK=a, aLeadTau=1.5, modelProb=0.9)
+
+
+def _upd(hc, v, lead, set_gap=7.52, fcw=False):
+  return hc.update(v, lead, "standard", 1.0, 1.45, 1.2, 6.0, fcw, 0.05, plan_a_min=0.0, set_gap=set_gap)
+
+
+def test_launch075_defaults():
+  c = HC.HumanCityConfig()
+  assert c.launch_go and c.launch_jerk == pytest.approx(4.0) and c.launch_margin == pytest.approx(1.2)
+  assert c.set_gap_gate
+
+
+def test_launch075_aids_only_with_pulling_away_lead_at_set_gap():
+  hc = HC.HumanCity()
+  o = _upd(hc, 0.0, _lead(7.6, 0.5, 0.5))
+  assert o.launch_go and o.launch_jerk == pytest.approx(4.0)
+  # roll-stop gap gate: stopped inside the set stopping distance -> no aid
+  for lead in (_lead(7.3, 0.5, 0.5),                 # inside set gap
+               _lead(7.6, 0.5, -0.3),                # lead slowing
+               _lead(7.6, 0.0, 0.0),                 # lead stopped
+               SimpleNamespace(status=False, present=False)):
+    hc = HC.HumanCity()
+    o = _upd(hc, 0.0, lead)
+    assert not o.launch_go and o.launch_jerk is None and o.launch_margin == 0.0
+  hc = HC.HumanCity()
+  o = _upd(hc, 0.0, _lead(7.6, 0.5, 0.5), fcw=True)
+  assert not o.launch_go and o.launch_jerk is None
+
+
+def test_launch075_margin_grows_with_speed_never_shrinks_until_rolling():
+  hc = HC.HumanCity()
+  assert _upd(hc, 0.0, _lead(7.6, 0.5, 0.5)).launch_margin == 0.0   # never delays the launch itself
+  m1 = _upd(hc, 0.5, _lead(8.0, 1.0, 0.5)).launch_margin
+  m2 = _upd(hc, 1.2, _lead(8.5, 1.0, -1.5)).launch_margin
+  m3 = _upd(hc, 0.2, _lead(8.0, 0.0, 0.0)).launch_margin             # lead stopped, we slow: kept
+  m4 = _upd(hc, 0.2, SimpleNamespace(status=False, present=False)).launch_margin  # lost lead: kept
+  assert 0.0 < m1 < m2 == pytest.approx(1.2) and m3 == pytest.approx(1.2) and m4 == pytest.approx(1.2)
+  assert _upd(hc, 6.0, _lead(30.0, 6.0)).launch_margin == 0.0         # rolling: episode over
+
+
+def test_limit_accel_rise_override_only_raises_rate():
+  from openpilot.sunnypilot.selfdrive.controls.lib import devc4_test3_accel_curve as AC
+  dt = 0.05
+  assert AC.limit_accel_rise(1.0, 0.0, 0.0, dt, jerk=4.0) == pytest.approx(0.2)
+  assert AC.limit_accel_rise(1.0, 0.0, 0.0, dt, jerk=0.1) == pytest.approx(AC.jerk_up(0.0) * dt)
+  assert AC.limit_accel_rise(-2.0, 0.5, 0.0, dt, jerk=4.0) == -2.0     # braking passes through
+
+
+def test_launch_kick_drop_and_winddown():
+  import opendbc.sunnypilot.car.toyota.launch_release as LR
+  assert LR.launch_kick_floor(0.2, 0.0, True, True) == pytest.approx(LR.LAUNCH_KICK_ACCEL)
+  assert LR.LAUNCH_KICK_ACCEL == pytest.approx(0.65)
+  assert LR.launch_kick_floor(0.2, 0.2, True, True) is None            # already rolling
+  assert LR.launch_kick_floor(0.0, 0.0, True, True) is None            # no positive request
+  assert LR.launch_kick_floor(-1.0, 0.0, True, True) is None
+  assert LR.launch_kick_floor(0.2, 0.0, False, True) is None           # still Stopping
+  assert LR.launch_kick_floor(0.2, 0.0, True, False) is None
+  assert LR.drop_positive_on_brake(0.65, -0.5, 0.5, True) == 0.0        # brake at once
+  assert LR.drop_positive_on_brake(0.65, 0.3, 0.5, True) == 0.65
+  assert LR.drop_positive_on_brake(-1.0, -2.0, 0.5, True) == -1.0
+  assert LR.drop_positive_on_brake(0.65, -0.5, 10.0, True) == 0.65      # low speed only
+  assert LR.winddown_limit(1.0, -0.12, 0.03) == pytest.approx(-20.0 * 0.03)
+  assert LR.winddown_limit(10.0, -0.12, 0.03) == -0.12
+
+
+def test_stopping_follow_plan_only_adds_braking():
+  import openpilot.selfdrive.controls.lib.longcontrol as LCM
+  CP = SimpleNamespace(stopAccel=-2.0, longitudinalTuning=SimpleNamespace(kiBP=[0.], kiV=[0.]))
+  CS = SimpleNamespace(vEgo=0.2, aEgo=0.0, brakePressed=False, cruiseState=SimpleNamespace(standstill=False))
+  for a_t, lo, hi in ((-1.5, -1.5, -1.5), (0.05, -0.02, 0.0), (-5.0, -2.0, -2.0)):
+    lc = LCM.LongControl(CP, SimpleNamespace(enableGasInterceptor=False))
+    lc.last_output_accel = 0.0
+    lc.long_control_state = LCM.LongCtrlState.stopping
+    out = lc.update(True, CS, a_t, True, (-3.5, 2.0))
+    assert lo - 1e-6 <= out <= hi + 1e-6, (a_t, out)
+
+
+def test_launch075_planner_and_carcontroller_wiring():
+  planner = (ROOT / "openpilot/selfdrive/controls/lib/longitudinal_planner.py").read_text()
+  assert "jerk=launch_jerk" in planner and "launch_go" in planner and "self.mpc.launch_margin = hc.launch_margin" in planner
+  assert "set_gap=STOP_DISTANCE + get_lead_stop_extra(personality, exp_mode)" in planner
+  cc = (ROOT / "opendbc_repo/opendbc/car/toyota/carcontroller.py").read_text()
+  assert "launch_kick_floor" in cc and "drop_positive_on_brake" in cc and "winddown_limit" in cc
+
+
+def test_launch075_closed_loop_near_miss_holds_set_gap(sims):
+  if ("launch", "aggressive") not in sims:
+    pytest.skip("launch_release not in this tree")
+  for p in PERS:
+    for name, r in sims[("launch", p)].items():
+      # launches from a stop (Nov 13 shape): at or beyond the set gap.
+      # nm_lead_lost_while_stopping_15mph (Agg -0.27 at 96ca223ce1) has no launch.
+      if r["kind"] == "nearmiss" and r["set_gap_check"] and r["t_move"]:
+        assert r["min_gap_minus_stop_gap_m"] >= -0.01, (p, name, r["min_gap_minus_stop_gap_m"])
+    tm = [x for name in ("signal_queue_40mph", "signal_queue_35mph_firm", "launch_to35mph")
+          for x in sims[("launch", p)][name]["t_move"]]
+    assert 0.55 <= sorted(tm)[len(tm) // 2] <= 0.85, (p, tm)

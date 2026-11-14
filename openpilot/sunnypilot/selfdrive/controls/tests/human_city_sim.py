@@ -199,12 +199,32 @@ class Lead:
     return self.i >= len(self.segs)
 
 
+def SETGAP(p):
+  import inspect
+  return {"set_gap": stop_gap(p)} if "set_gap" in inspect.signature(HC.HumanCity.update).parameters else {}
+
+
 def run(personality, sc, cand):
   exp = False
   cfg = cand.get("human")
   hc = HC.HumanCity(HC.HumanCityConfig(**cfg)) if cfg is not None else None
   hold = HC.LeadHoldover() if (hc is not None and hc.config.lead_holdover) else None
   use_rel = bool(cand.get("release", False) and release_prev_accel is not None)
+  import openpilot.selfdrive.controls.lib.longcontrol as LCM
+  if hasattr(LCM, "STOPPING_FOLLOW_PLAN"):
+    LCM.STOPPING_FOLLOW_PLAN = bool(cand.get("stopping_follow_plan", use_rel))
+  try:
+    import opendbc.sunnypilot.car.toyota.launch_release as LR
+  except Exception:
+    LR = None
+  if LR is not None and hasattr(LR, "LAUNCH_KICK_ACCEL"):
+    LR.LAUNCH_KICK_ACCEL = float(cand.get("kick", LR.LAUNCH_KICK_ACCEL)) if use_rel else 0.0
+  if LR is not None and hasattr(LR, "LOW_SPEED_WINDDOWN_RATE"):
+    LR.LOW_SPEED_WINDDOWN_RATE = float(cand.get("winddown", LR.LOW_SPEED_WINDDOWN_RATE)) if use_rel else 4.0
+  use_drop = bool(use_rel and LR is not None and hasattr(LR, "drop_positive_on_brake") and cand.get("drop", True))
+  if use_rel and cand.get("release_hold") is not None:
+    import opendbc.sunnypilot.car.toyota.launch_release as LR
+    LR.LAUNCH_RELEASE_HOLD = float(cand["release_hold"])
   mpc = LM.LongitudinalMpc()
   g_stop = stop_gap(personality)
   ev = sc["ev0"]; lv = sc["lv0"]
@@ -237,7 +257,7 @@ def run(personality, sc, cand):
   solve_fail = 0
   rng = np.random.default_rng(1234)
   t = 0.0; k = 0
-  min_gap = 1e9; min_gap_rel_set = 1e9; min_gap_stop_rel = 1e9; peak_a = 0.0; peak_d = 0.0; peak_j = 0.0
+  min_gap = 1e9; min_gap_rel_set = 1e9; min_gap_stop_rel = 1e9; peak_a = 0.0; peak_d = 0.0; peak_j = 0.0; peak_j_low = 0.0
   jerk_sq = 0.0; n_j = 0
   ea_hist = []; v_hist = []; collided = False; v_peak = 0.0
   moves = []; lead_was_stopped = lv < 0.05; t_lead_start = None
@@ -287,7 +307,8 @@ def run(personality, sc, cand):
       vdf.x = max(0.0, vdf.update(ev))
       pac = not standstill
       fcw_prev = mpc.crash_cnt > 2 and not standstill
-      jf = None; tf = None; dcost = None; mpc.stop_extra_predicted = 0.0
+      jf = None; tf = None; dcost = None; lj = None; lgo = False; mpc.stop_extra_predicted = 0.0
+      mpc.launch_margin = 0.0
       mpc.lead_danger_factor = LM.LEAD_DANGER_FACTOR
       if hold is not None:
         held = hold.update(rs.leadOne, ev, 0.05)
@@ -297,8 +318,11 @@ def run(personality, sc, cand):
         base_t = LM.get_T_FOLLOW(personality, exp, vdf.x)
         o = hc.update(ev, rs.leadOne, PNAME[personality], LM.get_jerk_factor(personality, exp), base_t, cap,
                       follow_gap(ev, float(rs.leadOne.vLead), base_t) if HC.lead_present(rs.leadOne) else float("nan"), fcw_prev, 0.05,
-                      plan_a_min=float(np.min(mpc.a_solution[:HUMAN_PLAN_N])))
+                      plan_a_min=float(np.min(mpc.a_solution[:HUMAN_PLAN_N])), **SETGAP(personality))
         jf, cap, tf, dcost = o.jerk_factor, o.cap, o.t_follow, o.danger_cost
+        lj = getattr(o, "launch_jerk", None)
+        lgo = bool(getattr(o, "launch_go", False))
+        mpc.launch_margin = float(getattr(o, "launch_margin", 0.0))
         mpc.stop_extra_predicted = o.stop_extra_predicted
         if o.danger_factor is not None:
           mpc.lead_danger_factor = o.danger_factor
@@ -313,9 +337,15 @@ def run(personality, sc, cand):
       a_prev = out_a
       a_mpc = get_accel_from_plan(vt, at, CTRL_T, action_t=0.05 + 0.05)
       a_cruise = LP.get_cruise_accel(v_cruise, ev, a_cruise, 0.05, cap=cap)
-      ss = should_stop(ev, a_mpc) or should_stop(ev, a_cruise)
+      ss_mpc = should_stop(ev, a_mpc)
+      if lgo:
+        ss_mpc = bool(ev < HC.LAUNCH_GO_V_MAX and a_mpc < HC.LAUNCH_GO_A_MIN)
+      ss = ss_mpc or should_stop(ev, a_cruise)
       a_t = float(np.clip(min(a_mpc, a_cruise), ACCEL_MIN, cap))
-      a_t = float(LP.limit_accel_rise(a_t, a_prev, ev, 0.05))
+      try:
+        a_t = float(LP.limit_accel_rise(a_t, a_prev, ev, 0.05, jerk=lj))
+      except TypeError:  # older trees without the jerk override
+        a_t = float(LP.limit_accel_rise(a_t, a_prev, ev, 0.05))
       out_a = a_t; plan_a = a_t
       vdf.x = vdf.x + 0.05 * (out_a + a_prev) / 2.0
     CS = SimpleNamespace(vEgo=ev, aEgo=ea, brakePressed=False, standstill=ev < 1e-3,
@@ -324,7 +354,14 @@ def run(personality, sc, cand):
     if k % 3 == 0:
       if use_rel:
         prev_accel = release_prev_accel(prev_accel, act, ev, lc.long_control_state == LongCtrlState.pid, True)
-      pcm = rate_limit(act, prev_accel, -4.0 * 0.03, 4.0 * 0.03)
+      if use_drop:
+        prev_accel = LR.drop_positive_on_brake(prev_accel, act, ev, True)
+      wd = LR.winddown_limit(ev, -4.0 * 0.03, 0.03) if (use_rel and LR is not None and hasattr(LR, "winddown_limit")) else -4.0 * 0.03
+      pcm = rate_limit(act, prev_accel, wd, 4.0 * 0.03)
+      if use_rel and LR is not None and hasattr(LR, "launch_kick_floor"):
+        kf = LR.launch_kick_floor(act, ev, lc.long_control_state == LongCtrlState.pid, True)
+        if kf is not None:
+          pcm = max(pcm, kf)
       prev_accel = pcm
       prev_ae = aego_f.x; aego_f.update(ea)
       j_ego = (aego_f.x - prev_ae) / 0.03
@@ -359,6 +396,8 @@ def run(personality, sc, cand):
       ea_hist.pop(0)
       if ev > 0.1 and min(v_hist) > 0.1:
         peak_j = max(peak_j, abs(j)); jerk_sq += j * j; n_j += 1
+      elif ev > 0.0 or ea_hist[-2] > 0.0:
+        peak_j_low = max(peak_j_low, abs(j))
     if sc["kind"] == "headway" and t > 35.0 and ev > 1.0:
       hw_samples.append(gap / ev)
     if k % 20 == 0:
@@ -368,7 +407,7 @@ def run(personality, sc, cand):
               min_gap_minus_stop_gap_m=round(min_gap - g_stop, 2),
               standstill_gap_minus_stop_gap_m=None if min_gap_stop_rel > 1e8 else round(min_gap_stop_rel, 2),
               stop_gaps_m=stop_gaps, final_gap_m=round(lx - ex, 2), peak_accel=round(peak_a, 3),
-              peak_decel=round(peak_d, 3), peak_jerk=round(peak_j, 2), rms_jerk=round(math.sqrt(jerk_sq / max(n_j, 1)), 3),
+              peak_decel=round(peak_d, 3), peak_jerk=round(peak_j, 2), peak_jerk_low=round(peak_j_low, 2), rms_jerk=round(math.sqrt(jerk_sq / max(n_j, 1)), 3),
               t_move=moves, t_move_mean=round(float(np.mean(moves)), 3) if moves else None,
               t_move_max=round(float(max(moves)), 3) if moves else None,
               headway_s=round(float(np.mean(hw_samples)), 3) if hw_samples else None,

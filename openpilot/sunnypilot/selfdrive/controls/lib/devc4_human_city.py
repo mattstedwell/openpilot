@@ -109,6 +109,34 @@ HUMAN_CAP = {"aggressive": (1.75, 1.60, 0.0), "standard": (1.50, 1.40, 0.0), "re
 TAKEUP_A_LEAD_MIN = -0.05
 TAKEUP_V_LEAD_MIN = 0.15
 TAKEUP_GAP_MARGIN = 0.05
+# launch075 (t361u + steering: t_move ~0.75 s): while the same take-up gate
+# holds and we are nearly stopped, let the planned accel rise faster than
+# the comfort rise limit (0.6 m/s³), so the brake hold is released and
+# drive torque arrives sooner after the lead moves. Faded out 1 -> 3 m/s.
+# Only raises the *rise rate* of a positive request; the MPC lead plan
+# still bounds the request and any decrease / braking passes through.
+LAUNCH_JERK = 4.0               # m/s³ (comfort rise limit is 0.6)
+LAUNCH_JERK_V_BP = (1.0, 3.0)   # m/s; full below 1, none above 3
+# launch075 early go: under the same gate, while nearly stopped, leave the
+# Stopping state once the MPC plans any real positive accel (> this)
+# instead of the official 0.1 m/s² should_stop threshold.
+LAUNCH_GO_A_MIN = 0.03          # m/s²
+LAUNCH_GO_V_MAX = 0.3           # m/s (official should_stop speed)
+# Repeated roll-stop gap gate: none of the launch aids (take-up ceiling,
+# faster rise, lower jerk cost, early go) engage unless the gap is at
+# least the personality's set stopping distance (minus a small radar
+# tolerance). After a roll-stop that ended inside the set gap, the car
+# waits for the lead to open the gap first and then launches stock.
+SET_GAP_TOL = 0.05              # m
+# Launch margin: from a gated quick launch until we pass LAUNCH_EP_V_END,
+# the MPC plans this much extra space to the
+# lead. A lead that creeps and stops right after we launch (the Nov 13
+# near-miss shape) is then met at or beyond the set stopping distance
+# even though we started sooner. Adds space only; after such a stop the
+# standstill gap can be up to this much larger than the set distance.
+LAUNCH_MARGIN = 1.2             # m
+LAUNCH_EP_V_END = 5.0           # m/s
+LAUNCH_MARGIN_V_BP = (0.0, 1.0)  # m/s; margin grows with ego speed, so it never delays the launch itself
 
 
 @dataclass(frozen=True)
@@ -124,6 +152,12 @@ class HumanCityConfig:
   boost_rate_up: float = BOOST_RATE_UP
   boost_on_decel: bool = True
   human_launch: bool = True      # LAUNCH CHANGE (planner ceiling); dev-c4-human-launch only, needs Matt review
+  launch_jerk: float = LAUNCH_JERK  # LAUNCH CHANGE (launch075): gated faster take-up rise rate, m/s³
+  launch_jerk_factor: float | None = None  # launch075: MPC jerk factor ceiling during the gated take-up
+  lead_brake_jerk_factor: float | None = None  # launch075: MPC jerk factor ceiling near a slow/braking lead
+  launch_go: bool = True         # launch075: early exit from Stopping under the gate
+  set_gap_gate: bool = True      # launch075: roll-stop gap gate on every launch aid
+  launch_margin: float = LAUNCH_MARGIN  # launch075: extra planned lead space after a quick launch, m
 
 
 DEFAULT_CONFIG = HumanCityConfig()
@@ -286,6 +320,9 @@ class HumanCityOutput:
   danger_cost: float | None = None
   stop_extra_predicted: float = 0.0
   cap: float = 0.0
+  launch_jerk: float | None = None   # m/s³ rise-rate override for limit_accel_rise, None = stock
+  launch_go: bool = False            # leave Stopping at a_mpc > LAUNCH_GO_A_MIN instead of 0.1
+  launch_margin: float = 0.0         # m, extra planned lead space (adds space only)
 
 
 class HumanCity:
@@ -293,14 +330,18 @@ class HumanCity:
     self.config = config
     self.t_offset = 0.0   # s; <= 0, how far T is below stock
     self.boost = 0.0
+    self.launch_ep = False
+    self.launch_w = 0.0
     self.out = HumanCityOutput()
 
   def reset(self):
     self.t_offset = 0.0
     self.boost = 0.0
+    self.launch_ep = False
+    self.launch_w = 0.0
 
   def update(self, v_ego, lead, personality_name, base_jerk_factor, base_t_follow, cap, desired_gap,
-             fcw, dt, plan_a_min=None) -> HumanCityOutput:
+             fcw, dt, plan_a_min=None, set_gap=None) -> HumanCityOutput:
     c = self.config
     if not c.enabled:
       self.reset()
@@ -330,8 +371,31 @@ class HumanCity:
       t_follow = tb + min(self.t_offset, 0.0)
 
     out_cap = float(cap)
-    if c.human_launch and takeup_ok(v, lead, desired_gap, fcw) and u <= 0.0:
+    launch_jerk = None
+    launch_go = False
+    gap_ok = True
+    if c.set_gap_gate and set_gap is not None:
+      d = _f(getattr(lead, "dRel", float("nan"))) if lead_present(lead) else float("nan")
+      sg = _f(set_gap)
+      gap_ok = math.isfinite(d) and math.isfinite(sg) and d >= sg - SET_GAP_TOL
+    if c.human_launch and gap_ok and takeup_ok(v, lead, desired_gap, fcw) and u <= 0.0:
       out_cap = max(out_cap, human_launch_cap(v, personality_name))
+      w_lj = 1.0 - _ramp(v, LAUNCH_JERK_V_BP)
+      if c.launch_jerk > 0.0 and w_lj > 0.0:
+        launch_jerk = w_lj * c.launch_jerk
+      if c.launch_jerk_factor is not None and w_lj > 0.0:
+        jf = jf - w_lj * max(jf - c.launch_jerk_factor, 0.0)
+      launch_go = bool(c.launch_go and v < LAUNCH_GO_V_MAX)
+      if v < LAUNCH_GO_V_MAX and c.launch_margin > 0.0:
+        self.launch_ep = True
+    # Ends only once we are clearly rolling. Not on FCW or a lost lead:
+    # the margin only adds space, so keeping it is the careful side.
+    if self.launch_ep and (not math.isfinite(v) or v > LAUNCH_EP_V_END):
+      self.launch_ep = False
+    # grows with speed, never shrinks inside an episode (a stop after a
+    # quick launch keeps the margin, so it ends at or beyond the set gap)
+    self.launch_w = max(self.launch_w, _ramp(v, LAUNCH_MARGIN_V_BP)) if self.launch_ep else 0.0
+    launch_margin = c.launch_margin * self.launch_w
 
     b_target = wc * boost_weight(lead, c.boost_on_decel)
     if b_target > self.boost:
@@ -339,11 +403,17 @@ class HumanCity:
     else:
       self.boost = max(b_target, self.boost - BOOST_RATE_DOWN * dt)
     wb = self.boost
+    if c.lead_brake_jerk_factor is not None:
+      # Matt (t361u steering): firm, fast response to a slow / braking lead
+      # beats smoothness, so the MPC jerk cost can only be lowered here.
+      jf = jf - wb * max(jf - c.lead_brake_jerk_factor, 0.0)
     danger_factor = None
     if c.danger_factor is not None:
       danger_factor = LEAD_DANGER_FACTOR_STOCK + wb * max(c.danger_factor - LEAD_DANGER_FACTOR_STOCK, 0.0)
     self.out = HumanCityOutput(city=wc, dense=-self.t_offset, urgency=u, jerk_factor=jf, t_follow=t_follow,
                                danger_factor=danger_factor,
                                danger_cost=DANGER_ZONE_COST_STOCK * (1.0 + wb * max(c.danger_cost_scale - 1.0, 0.0)),
-                               stop_extra_predicted=wc if c.stop_extra_predicted else 0.0, cap=out_cap)
+                               stop_extra_predicted=wc if c.stop_extra_predicted else 0.0, cap=out_cap,
+                               launch_jerk=launch_jerk, launch_go=launch_go,
+                               launch_margin=launch_margin)
     return self.out

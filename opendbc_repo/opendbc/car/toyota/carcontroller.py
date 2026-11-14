@@ -13,7 +13,8 @@ from opendbc.car.toyota.values import CAR, NO_STOP_TIMER_CAR, TSS2_CAR, \
 from opendbc.can import CANPacker
 
 from opendbc.sunnypilot.car.toyota.gas_interceptor import GasInterceptorCarController
-from opendbc.sunnypilot.car.toyota.launch_release import release_prev_accel
+from opendbc.sunnypilot.car.toyota.launch_release import release_prev_accel, launch_kick_floor, drop_positive_on_brake, \
+  winddown_limit
 from opendbc.sunnypilot.car.toyota.values import ToyotaFlagsSP, TSS2_SMOOTH_KI
 
 Ecu = structs.CarParams.Ecu
@@ -223,7 +224,13 @@ class CarController(CarControllerBase, GasInterceptorCarController):
           # hold in one step. Braking requests are untouched.
           self.prev_accel = release_prev_accel(self.prev_accel, actuators.accel, CS.out.vEgo,
                                                actuators.longControlState == LongCtrlState.pid, CC.longActive)
-          pcm_accel_cmd = rate_limit(pcm_accel_cmd, self.prev_accel, ACCEL_WINDDOWN_LIMIT, ACCEL_WINDUP_LIMIT)
+          self.prev_accel = drop_positive_on_brake(self.prev_accel, actuators.accel, CS.out.vEgo, CC.longActive)
+          pcm_accel_cmd = rate_limit(pcm_accel_cmd, self.prev_accel,
+                                     winddown_limit(CS.out.vEgo, ACCEL_WINDDOWN_LIMIT, DT_CTRL * 3), ACCEL_WINDUP_LIMIT)
+          kick = launch_kick_floor(actuators.accel, CS.out.vEgo,
+                                   actuators.longControlState == LongCtrlState.pid, CC.longActive)
+          if kick is not None:
+            pcm_accel_cmd = max(pcm_accel_cmd, kick)
         self.prev_accel = pcm_accel_cmd
 
         # calculate amount of acceleration PCM should apply to reach target, given pitch.

@@ -135,10 +135,15 @@ def jerk_up(v_ego) -> float:
   return JERK_UP_V[0] + (JERK_UP_V[1] - JERK_UP_V[0]) * v / JERK_UP_BP[1]
 
 
-def limit_accel_rise(a_target, a_prev, v_ego, dt) -> float:
+def limit_accel_rise(a_target, a_prev, v_ego, dt, jerk=None) -> float:
   """Rate-limit only *increases* of positive accel. Decreases (less
   accel, more braking) pass through unchanged; from a braking command
-  the first step above 0 is also limited from 0, not from a_prev."""
+  the first step above 0 is also limited from 0, not from a_prev.
+  jerk: optional higher rise rate (m/s³) for a gated launch take-up
+  (dev-c4-human launch075); it can only raise the rate, never lower it."""
   a = float(a_target)
-  ceiling = max(float(a_prev), 0.0) + jerk_up(v_ego) * float(dt)
+  rate = jerk_up(v_ego)
+  if jerk is not None and math.isfinite(float(jerk)):
+    rate = max(rate, float(jerk))
+  ceiling = max(float(a_prev), 0.0) + rate * float(dt)
   return min(a, ceiling) if a > 0.0 else a

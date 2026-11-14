@@ -235,6 +235,7 @@ class LongitudinalMpc:
   def __init__(self, dt=DT_MDL):
     self.dt = dt
     self.stop_extra_predicted = 0.0  # dev-c4-human; set by the planner
+    self.launch_margin = 0.0  # dev-c4-human launch075: extra lead space (m) after a quick launch; adds space only
     # dev-c4-human: the planner may raise (never lower) the fraction of
     # the desired distance below which the danger-zone slack applies.
     self.lead_danger_factor = LEAD_DANGER_FACTOR
@@ -370,6 +371,8 @@ class LongitudinalMpc:
       return cur + w_pred * np.maximum(pred - cur, 0.0)
     if _present(radarstate.leadOne):
       lead_0_obstacle = lead_0_obstacle - _extra(lead_xv_0)
+      lm = float(self.launch_margin) if np.isfinite(self.launch_margin) else 0.0
+      lead_0_obstacle = lead_0_obstacle - max(lm, 0.0)
     if _present(radarstate.leadTwo):
       lead_1_obstacle = lead_1_obstacle - _extra(lead_xv_1)
 

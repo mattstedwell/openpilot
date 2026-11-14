@@ -22,9 +22,11 @@ from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_accel_curve import 
 from openpilot.sunnypilot.selfdrive.car import chill_relaxed
 from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_curve_comfort import CurveComfort
 from types import SimpleNamespace
-from openpilot.sunnypilot.selfdrive.controls.lib.devc4_human_city import HumanCity, LeadHoldover
+from openpilot.sunnypilot.selfdrive.controls.lib.devc4_human_city import HumanCity, LeadHoldover, \
+  LAUNCH_GO_A_MIN, LAUNCH_GO_V_MAX
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
-  get_jerk_factor, get_T_FOLLOW, get_safe_obstacle_distance, get_stopped_equivalence_factor, LEAD_DANGER_FACTOR)
+  get_jerk_factor, get_T_FOLLOW, get_safe_obstacle_distance, get_stopped_equivalence_factor, LEAD_DANGER_FACTOR,
+  STOP_DISTANCE, get_lead_stop_extra)
 from openpilot.cereal import log
 
 # dev-c4-human: horizon (first ~2 s) used for the urgency check
@@ -174,7 +176,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # planned from the lead's predicted stop). Never raises the plan
     # above the MPC lead plan; braking never limited. See devc4_human_city.py.
     jerk_factor, t_follow, danger_cost = None, None, None
+    launch_jerk = None
+    launch_go = False
     self.mpc.stop_extra_predicted = 0.0
+    self.mpc.launch_margin = 0.0
     self.mpc.lead_danger_factor = LEAD_DANGER_FACTOR
     radar_state = sm['radarState']
     if reset_state:
@@ -190,9 +195,13 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       hc = self.human_city.update(
         v_ego, lead_one, _PERSONALITY_NAME.get(personality, "standard"), get_jerk_factor(personality, exp_mode),
         base_t, cap, desired_follow_gap(v_ego, getattr(lead_one, 'vLead', float('nan')), base_t), self.fcw, self.dt,
-        plan_a_min=float(np.min(self.mpc.a_solution[:HUMAN_PLAN_N])))
+        plan_a_min=float(np.min(self.mpc.a_solution[:HUMAN_PLAN_N])),
+        set_gap=STOP_DISTANCE + get_lead_stop_extra(personality, exp_mode))
       cap = hc.cap
       jerk_factor, t_follow, danger_cost = hc.jerk_factor, hc.t_follow, hc.danger_cost
+      launch_jerk = hc.launch_jerk
+      launch_go = hc.launch_go
+      self.mpc.launch_margin = hc.launch_margin
       self.mpc.stop_extra_predicted = hc.stop_extra_predicted
       if hc.danger_factor is not None:
         self.mpc.lead_danger_factor = hc.danger_factor
@@ -224,6 +233,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     output_a_target_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
                                               action_t=action_t)
     output_should_stop_mpc = should_stop(v_ego, output_a_target_mpc)
+    if launch_go:
+      # launch075 early go (gated in HumanCity: lead pulling away, not
+      # slowing, gap >= set stopping distance, no FCW / urgency).
+      output_should_stop_mpc = bool(v_ego < LAUNCH_GO_V_MAX and output_a_target_mpc < LAUNCH_GO_A_MIN)
 
     self.a_cruise = get_cruise_accel(v_cruise, v_ego, self.a_cruise, self.dt, cap=cap)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
@@ -250,7 +263,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # limit only increases of positive accel (0.6 -> 0.45 m/s³ by speed).
     # Less accel / more braking is never delayed.
     if not reset_state:
-      self.output_a_target = limit_accel_rise(self.output_a_target, a_prev, v_ego, self.dt)
+      self.output_a_target = limit_accel_rise(self.output_a_target, a_prev, v_ego, self.dt, jerk=launch_jerk)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 

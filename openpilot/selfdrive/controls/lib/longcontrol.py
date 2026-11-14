@@ -9,6 +9,12 @@ CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
+# dev-c4-human launch075 (Matt, t361u steering: firm, fast response to the
+# lead beats smoothness): in Stopping, brake at least as hard as the plan
+# asks (bounded by stopAccel) instead of only ramping 1 m/s³ toward
+# stopAccel. Can only add braking; never reduces it, never drives.
+STOPPING_FOLLOW_PLAN = True
+
 
 def long_control_state_trans(CP_SP, active, long_control_state,
                              should_stop, brake_pressed, cruise_standstill):
@@ -69,6 +75,8 @@ class LongControl:
         output_accel = min(output_accel, 0.0)
         # TODO: can we just go straight to stopAccel?
         output_accel -= 1.0 * DT_CTRL  # m/s^2/s while trying to stop
+        if STOPPING_FOLLOW_PLAN and a_target < output_accel:
+          output_accel = max(float(a_target), self.CP.stopAccel)
       self.reset()
 
     else:  # LongCtrlState.pid
