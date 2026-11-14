@@ -19,6 +19,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import Lon
 from openpilot.sunnypilot.selfdrive.car.always_chill import ALWAYS_CHILL, experimental_mode_active
 from openpilot.sunnypilot.selfdrive.car.chill_aggressive import ChillAggressiveLaunch
 from openpilot.sunnypilot.selfdrive.car import chill_relaxed
+from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_curve_comfort import CurveComfort
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -87,6 +88,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.output_a_target = init_a
     self.output_should_stop = False
     self.chill_aggressive_launch = ChillAggressiveLaunch()
+    self.curve_comfort = CurveComfort()
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
     self.a_desired_trajectory = np.zeros(CONTROL_N)
@@ -119,6 +121,15 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       v_ego, v_cruise if v_cruise_initialized else 0., sm['carState'].brakePressed)
     chill_relaxed_mode = chill_relaxed.is_chill_relaxed(exp_mode, personality)
     cap = get_max_accel(v_ego, launch_boost, chill_relaxed_mode)
+    # devc4-test3 curve comfort (t311u): lower only the positive accel
+    # ceiling in curves (current + model-planned lateral accel). Braking
+    # is never limited: cap is only the upper clip and stays >= 0.
+    if reset_state:
+      self.curve_comfort.reset()
+    md = sm['modelV2']
+    cap = self.curve_comfort.update(
+      cap, v_ego, sm['controlsState'].curvature,
+      md.orientationRate.z, md.velocity.x, ModelConstants.T_IDXS, self.dt)
 
     if reset_state:
       self.v_desired_filter.x = v_ego
