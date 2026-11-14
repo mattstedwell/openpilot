@@ -19,7 +19,7 @@ delay + 0.25 s lag, hybrid actuator delay 0.05 s. The model's e2e
 candidate is not simulated (always-Chill build). Host-only; not
 road-tested.
 """
-import importlib.util, json, math, sys
+import importlib.util, json, math, os, sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -106,6 +106,17 @@ def signal_cycle(v_peak, n=3, up=1.5, dn=-1.8, green=12.0, red=20.0):
   return segs
 
 
+ROLLSTOP_PAUSES = (0.5, 1.0, 2.0, 3.0, 0.5, 1.5, 2.5, 1.0, 2.0)
+
+
+def rollstop(dists, pauses=ROLLSTOP_PAUSES, up=1.0, dn=-1.5):
+  segs = [("hold", 2.0)]
+  for i, d in enumerate(dists):
+    segs += [("dist", up, dn, float(d)), ("hold", pauses[i % len(pauses)])]
+  segs += [("hold", 4.0)]
+  return segs
+
+
 SCENARIOS = [
   # steady following: time headway (gap / v) after settling
   *[S(f"follow_{m}mph", [("hold", 45.0)], ev0=m * MPH, lv0=m * MPH, kind="headway", headway_mph=m, t_tail=0.0,
@@ -153,6 +164,16 @@ SCENARIOS = [
     cut=dict(t=2.0, gap=4.0, v=4 * MPH), kind="nearmiss", set_gap_check=False),
   S("nm_cutin_crawl_8m_stop", [("hold", 2.5), ("acc", -2.5, 0.0), ("hold", 6.0)], ev0=8 * MPH, lv0=8 * MPH,
     cut=dict(t=2.0, gap=8.0, v=6 * MPH), kind="nearmiss", set_gap_check=False),
+  # --- repeated roll-stop (Matt, real world: "rolling stop roll stop resulted in my car
+  # getting closer each time"). >= 6 creep-stop cycles; standstill gap after every stop.
+  *[S(f"rs_{d}m", rollstop([d] * 8), kind="rollstop") for d in (0.5, 1, 2, 3, 5)],
+  S("rs_mixed", rollstop([0.5, 1, 2, 3, 5, 1, 0.5, 2, 3]), kind="rollstop"),
+  S("rs_mixed_noisy", rollstop([0.5, 1, 2, 3, 5, 1, 0.5, 2, 3]), kind="rollstop", noise=True),
+  S("rs_1m_noisy", rollstop([1] * 8), kind="rollstop", noise=True),
+  S("rs_3m_fast_pause", rollstop([3] * 8, pauses=(0.5,)), kind="rollstop"),
+  # long pauses: ego reaches standstill in every cycle
+  *[S(f"rs_{d}m_3s", rollstop([d] * 8, pauses=(3.0,)), kind="rollstop") for d in (0.5, 1, 2, 5)],
+  S("rs_2m_3s_noisy", rollstop([2] * 8, pauses=(3.0,)), kind="rollstop", noise=True),
 ]
 
 
@@ -261,7 +282,7 @@ def run(personality, sc, cand):
   jerk_sq = 0.0; n_j = 0
   ea_hist = []; v_hist = []; collided = False; v_peak = 0.0
   moves = []; lead_was_stopped = lv < 0.05; t_lead_start = None
-  stop_gaps = []; ego_stopped_prev = ev < 0.05
+  stop_gaps = []; ego_stopped_prev = ev < 0.05; cycle_gaps = []
   hw_samples = []; dense_max = 0.0; trace = []
   first_brake_t = None; lead_brake_t = None
   t_end_lead = None
@@ -285,6 +306,7 @@ def run(personality, sc, cand):
       lead_was_stopped = True
     elif lead_was_stopped and lv > 0.05:
       lead_was_stopped = False
+      cycle_gaps.append([round(gap, 2), round(ev, 2)])   # gap / ego speed when the lead moves again
       if ev < 0.05:
         t_lead_start = t
     if t_lead_start is not None and ev > 0.1:
@@ -323,6 +345,9 @@ def run(personality, sc, cand):
         lj = getattr(o, "launch_jerk", None)
         lgo = bool(getattr(o, "launch_go", False))
         mpc.launch_margin = float(getattr(o, "launch_margin", 0.0))
+        if os.environ.get("HCSIM_DEBUG") and k % 5 == 0:
+          print(f"DBG t={t:5.2f} d={float(rs.leadOne.dRel):6.2f} vl={float(rs.leadOne.vLead):5.2f} ev={ev:5.2f} "
+                f"lm={mpc.launch_margin:4.2f} ep={hc.launch_ep} w={hc.launch_w:4.2f} anc={getattr(hc, 'stop_anchor', None)}", file=sys.stderr)
         mpc.stop_extra_predicted = o.stop_extra_predicted
         if o.danger_factor is not None:
           mpc.lead_danger_factor = o.danger_factor
@@ -406,7 +431,7 @@ def run(personality, sc, cand):
   return dict(collision=collided, min_gap_m=round(min_gap, 2), stop_gap_m=round(g_stop, 2),
               min_gap_minus_stop_gap_m=round(min_gap - g_stop, 2),
               standstill_gap_minus_stop_gap_m=None if min_gap_stop_rel > 1e8 else round(min_gap_stop_rel, 2),
-              stop_gaps_m=stop_gaps, final_gap_m=round(lx - ex, 2), peak_accel=round(peak_a, 3),
+              stop_gaps_m=stop_gaps, cycle_gaps=cycle_gaps, final_gap_m=round(lx - ex, 2), peak_accel=round(peak_a, 3),
               peak_decel=round(peak_d, 3), peak_jerk=round(peak_j, 2), peak_jerk_low=round(peak_j_low, 2), rms_jerk=round(math.sqrt(jerk_sq / max(n_j, 1)), 3),
               t_move=moves, t_move_mean=round(float(np.mean(moves)), 3) if moves else None,
               t_move_max=round(float(max(moves)), 3) if moves else None,

@@ -137,6 +137,22 @@ SET_GAP_TOL = 0.05              # m
 LAUNCH_MARGIN = 1.2             # m
 LAUNCH_EP_V_END = 5.0           # m/s
 LAUNCH_MARGIN_V_BP = (0.0, 1.0)  # m/s; margin grows with ego speed, so it never delays the launch itself
+# Stop anchor (Matt, real world: "rolling stop roll stop resulted in my car
+# getting closer each time"). In one stop-and-go episode (cleared once we are
+# clearly rolling, > LAUNCH_EP_V_END) the standstill gap behind a stopped lead
+# is remembered after every stop (and the first one kept). At standstill /
+# launching the MPC lead obstacle is moved by (last stop - TOL - set), so the
+# launch sees the set gap, exactly as without it. While rolling toward a
+# slowing / stopped lead it plans to stop no closer than the FIRST stop + AIM,
+# so stops cannot ratchet closer. Adds lead space only; never more than
+# STOP_ANCHOR_MAX over the set stopping distance.
+STOP_ANCHOR_TOL = 0.05          # m
+STOP_ANCHOR_MAX = 1.5           # m over the set stopping distance
+STOP_ANCHOR_V = 0.05            # m/s, ego standstill
+STOP_ANCHOR_V_LEAD = 0.3        # m/s, lead counts as stopped
+STOP_ANCHOR_V_MOVED = 0.3       # m/s, ego rolled since the last stop (a new stop follows)
+STOP_ANCHOR_A_LEAD = -0.2       # m/s², lead counts as slowing
+STOP_ANCHOR_AIM = 0.15          # m, planned beyond the first stop (MPC stop overshoot is ~0.1-0.2 m)
 
 
 @dataclass(frozen=True)
@@ -158,6 +174,7 @@ class HumanCityConfig:
   launch_go: bool = True         # launch075: early exit from Stopping under the gate
   set_gap_gate: bool = True      # launch075: roll-stop gap gate on every launch aid
   launch_margin: float = LAUNCH_MARGIN  # launch075: extra planned lead space after a quick launch, m
+  stop_anchor: bool = True        # repeated roll-stop: later stops no closer than the first one
 
 
 DEFAULT_CONFIG = HumanCityConfig()
@@ -332,6 +349,9 @@ class HumanCity:
     self.boost = 0.0
     self.launch_ep = False
     self.launch_w = 0.0
+    self.stop_anchor = None   # m, standstill gap of the last stop in this stop-and-go episode
+    self.anchor_moved = False
+    self.stop_anchor_first = None
     self.out = HumanCityOutput()
 
   def reset(self):
@@ -339,6 +359,9 @@ class HumanCity:
     self.boost = 0.0
     self.launch_ep = False
     self.launch_w = 0.0
+    self.stop_anchor = None
+    self.anchor_moved = False
+    self.stop_anchor_first = None
 
   def update(self, v_ego, lead, personality_name, base_jerk_factor, base_t_follow, cap, desired_gap,
              fcw, dt, plan_a_min=None, set_gap=None) -> HumanCityOutput:
@@ -396,6 +419,36 @@ class HumanCity:
     # quick launch keeps the margin, so it ends at or beyond the set gap)
     self.launch_w = max(self.launch_w, _ramp(v, LAUNCH_MARGIN_V_BP)) if self.launch_ep else 0.0
     launch_margin = c.launch_margin * self.launch_w
+
+    # repeated roll-stop anchor (see STOP_ANCHOR_*)
+    sg_a = _f(set_gap) if set_gap is not None else float("nan")
+    if not c.stop_anchor or not math.isfinite(v) or v > LAUNCH_EP_V_END or not math.isfinite(sg_a):
+      self.stop_anchor = None
+      self.stop_anchor_first = None
+    else:
+      if v > STOP_ANCHOR_V_MOVED:
+        self.anchor_moved = True
+      if self.anchor_moved and v < STOP_ANCHOR_V and lead_present(lead):
+        d_a = _f(getattr(lead, "dRel", float("nan")))
+        vl_a = _f(getattr(lead, "vLead", float("nan")))
+        if math.isfinite(d_a) and math.isfinite(vl_a) and vl_a < STOP_ANCHOR_V_LEAD and d_a >= sg_a - SET_GAP_TOL:
+          self.stop_anchor = min(d_a, sg_a + STOP_ANCHOR_MAX)
+          if self.stop_anchor_first is None:
+            self.stop_anchor_first = self.stop_anchor
+          self.anchor_moved = False
+    if self.stop_anchor is not None and lead_present(lead):
+      # At standstill / launching: the last stop gap, so the MPC sees us at the
+      # set gap + TOL, the same as the plain launch case (no launch delay).
+      target = self.stop_anchor - STOP_ANCHOR_TOL
+      vl_a = _f(getattr(lead, "vLead", float("nan")))
+      al_a = _f(getattr(lead, "aLeadK", 0.0))
+      if self.anchor_moved and (not math.isfinite(vl_a) or vl_a < STOP_ANCHOR_V_LEAD or
+                                (math.isfinite(al_a) and al_a < STOP_ANCHOR_A_LEAD)):
+        # rolling toward a slowing / stopped lead: stop no closer than the
+        # FIRST stop of this episode (+ AIM for the MPC's overshoot) -> no ratchet
+        target = max(target, self.stop_anchor_first + STOP_ANCHOR_AIM)
+      target = min(target, sg_a + STOP_ANCHOR_MAX)
+      launch_margin = max(launch_margin, max(target - sg_a, 0.0))
 
     b_target = wc * boost_weight(lead, c.boost_on_decel)
     if b_target > self.boost:

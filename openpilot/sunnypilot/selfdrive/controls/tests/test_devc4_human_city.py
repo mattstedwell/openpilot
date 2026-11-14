@@ -310,7 +310,9 @@ def test_city_build_adds_no_accel_and_no_hesitation(sims):
         assert r["peak_accel"] <= 0.15, (p, name)  # gentle close-up to the dense gap
         continue
       assert r["peak_accel"] <= s["peak_accel"] + 0.1, (p, name)
-      if r["t_move_mean"] is not None and s["t_move_mean"] is not None:
+      # rollstop: stock "moves sooner" only because it creeps into the set gap
+      # (the ratchet Matt reported), so its t_move is not a fair reference there.
+      if r["t_move_mean"] is not None and s["t_move_mean"] is not None and r["kind"] != "rollstop":
         assert r["t_move_mean"] <= s["t_move_mean"] + 0.08, (p, name)
 
 
@@ -443,3 +445,95 @@ def test_launch075_closed_loop_near_miss_holds_set_gap(sims):
     tm = [x for name in ("signal_queue_40mph", "signal_queue_35mph_firm", "launch_to35mph")
           for x in sims[("launch", p)][name]["t_move"]]
     assert 0.55 <= sorted(tm)[len(tm) // 2] <= 0.85, (p, tm)
+
+
+# --- repeated roll-stop (Matt: "rolling stop roll stop resulted in my car getting closer each time") ---
+
+SET_AGG = 7.52
+
+
+def test_stop_anchor_defaults_and_bounds():
+  assert HC.HumanCityConfig().stop_anchor
+  assert HC.STOP_ANCHOR_TOL == pytest.approx(0.05) and 0.0 < HC.STOP_ANCHOR_AIM <= 0.2
+  assert HC.STOP_ANCHOR_MAX == pytest.approx(1.5)
+
+
+def test_stop_anchor_later_stops_plan_no_closer_than_first():
+  hc = HC.HumanCity()
+  _upd(hc, 0.0, _lead(7.6, 0.0))                         # initial standstill: not an anchor (no roll yet)
+  assert hc.stop_anchor is None
+  _upd(hc, 0.6, _lead(8.2, 0.8, 0.5))                    # creep
+  _upd(hc, 0.0, _lead(8.5, 0.0))                         # first stop after rolling: anchor 8.5
+  assert hc.stop_anchor == pytest.approx(8.5) and hc.stop_anchor_first == pytest.approx(8.5)
+  # standstill / launching: MPC sees the set gap + TOL -> launch not delayed
+  o = _upd(hc, 0.0, _lead(8.5, 0.5, 0.8))
+  assert o.launch_margin == pytest.approx(max(1.2 * hc.launch_w, 8.5 - HC.STOP_ANCHOR_TOL - SET_AGG))
+  # rolling toward a stopped lead: stop no closer than the first stop + AIM
+  o = _upd(hc, 0.5, _lead(8.9, 0.0))
+  assert o.launch_margin >= 8.5 + HC.STOP_ANCHOR_AIM - SET_AGG - 1e-6
+  # a closer second stop does not lower the planned stop below the first
+  _upd(hc, 0.0, _lead(8.3, 0.0))
+  assert hc.stop_anchor == pytest.approx(8.3) and hc.stop_anchor_first == pytest.approx(8.5)
+  _upd(hc, 0.6, _lead(8.6, 0.6, 0.5))
+  o = _upd(hc, 0.5, _lead(8.7, 0.1, -1.0))
+  assert o.launch_margin >= 8.5 + HC.STOP_ANCHOR_AIM - SET_AGG - 1e-6
+
+
+def test_stop_anchor_capped_cleared_and_gated():
+  hc = HC.HumanCity()
+  _upd(hc, 0.6, _lead(12.0, 0.5))
+  _upd(hc, 0.0, _lead(14.0, 0.0))                        # far stop: capped at set + MAX
+  assert hc.stop_anchor == pytest.approx(SET_AGG + HC.STOP_ANCHOR_MAX)
+  assert _upd(hc, 0.5, _lead(14.0, 0.0)).launch_margin <= HC.STOP_ANCHOR_MAX + 1e-6
+  _upd(hc, 6.0, _lead(30.0, 6.0))                        # clearly rolling: cleared
+  assert hc.stop_anchor is None and hc.stop_anchor_first is None
+  # no anchor while the lead still moves, or when stopped inside the set gap
+  for ld in (_lead(8.5, 1.0), _lead(7.3, 0.0)):
+    hc = HC.HumanCity()
+    _upd(hc, 0.6, _lead(9.0, 1.0))
+    _upd(hc, 0.0, ld)
+    assert hc.stop_anchor is None
+  # off switch
+  hc = HC.HumanCity(HC.HumanCityConfig(stop_anchor=False))
+  _upd(hc, 0.6, _lead(9.0, 1.0))
+  _upd(hc, 0.0, _lead(8.5, 0.0))
+  assert hc.stop_anchor is None
+
+
+def test_repeated_roll_stop_scenarios_defined():
+  import re
+  src = (HERE / "human_city_sim.py").read_text()
+  assert 'kind="rollstop"' in src and "def rollstop(" in src
+  for d in ("0.5", "1", "2", "3", "5"):
+    assert d in re.search(r"for d in \(0\.5, 1, 2, 3, 5\)", src).group(0)
+  assert "rs_mixed_noisy" in src and "rs_1m_noisy" in src and "rs_2m_3s_noisy" in src
+  assert "cycle_gaps" in src
+
+
+def test_repeated_roll_stop_hard_gate(sims):
+  """HARD gate for the shipped build (launch075 = HumanCityConfig defaults):
+  every standstill >= set stopping distance - 0.05 m, and the last stop >=
+  the first stop - 0.1 m (no ratchet closer), all personalities. The older
+  city-only candidate (human_launch off, no release helpers) gets the set-gap
+  half of the gate only."""
+  ship = "launch" if ("launch", "aggressive") in sims else "city"
+  for b in _builds(sims):
+    for p in PERS:
+      rs = {n: r for n, r in sims[(b, p)].items() if r["kind"] == "rollstop"}
+      assert len(rs) >= 10, (b, p)
+      for name, r in rs.items():
+        sg, st = r["stop_gaps_m"], r["stop_gap_m"]
+        assert not r["collision"], (b, p, name)
+        assert sg, (b, p, name)
+        assert len(r["cycle_gaps"]) >= 6, (b, p, name)
+        assert min(sg) >= st - 0.05, (b, p, name, sg, st)
+        if b == ship:
+          assert sg[-1] >= sg[0] - 0.1, (b, p, name, sg)
+        assert r["min_gap_minus_stop_gap_m"] >= -0.05, (b, p, name, r["min_gap_minus_stop_gap_m"])
+
+
+def test_repeated_roll_stop_scenarios_catch_stock_ratchet(sims):
+  # sanity: the module-off dev-c4 behaviour reproduces Matt's report in sim
+  bad = [(p, n) for p in PERS for n, r in sims[("stock", p)].items()
+         if r["kind"] == "rollstop" and r["stop_gaps_m"] and min(r["stop_gaps_m"]) < r["stop_gap_m"] - 0.05]
+  assert len(bad) >= 10, bad
