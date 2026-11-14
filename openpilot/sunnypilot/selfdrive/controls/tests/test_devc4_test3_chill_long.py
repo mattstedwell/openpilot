@@ -1,12 +1,11 @@
 """devc4-test3: C3X Chill longitudinal policy, on official sunnypilot/dev.
 
-T_FOLLOW, jerk costs, stopped-gap extras, and accel caps are pinned to
-C3X dev-test a413dbf814 / old test3: Standard uses the C3X stock curve
-[1.6, 1.2, 0.8, 0.6] at [0, 10, 25, 40] m/s (not this tree's official
-flat ACCEL_MAX=2.0); Relaxed is 80% of that; Aggressive is the C3X
-curve plus a +0.4 launch boost tapering out by 22 mph. Open-loop 0-30
-and 55-75 times should match C3X (Std 10.149 / 12.011, Agg 9.342,
-Rel 12.686 / 15.014).
+T_FOLLOW, jerk costs and stopped-gap extras are pinned to C3X dev-test
+a413dbf814 / old test3. Accel caps (t314u/t316u) are no longer the C3X
+piecewise curve: each personality has a smooth, gentler PCHIP curve
+(devc4_test3_accel_curve) and Agg/Std blend onto Relaxed over 35-50 mph.
+Open-loop 0-30 times are now Agg 11.102 / Std 12.801 / Rel 15.111 s (C3X
+was 9.342 / 10.149 / 12.686) and 55-75 is 18.272 s for all three.
 
 Host-safe (stubs the aarch64 solver). Nothing here is road-tested.
 Experimental / e2e paths are not part of this port. Always-Chill stays on.
@@ -97,57 +96,44 @@ def test_jerk_factors():
   assert get_jerk_factor(P.aggressive, False) == 0.5
 
 
-def test_accel_caps_match_c3x():
+def test_accel_caps_smooth_curve():
   assert chill_relaxed.MAX_ACCEL_SCALE == pytest.approx(0.8)
   # Official unpatched sunnypilot/dev is still a flat 2.0; we pin below it.
   assert ACCEL_MAX == pytest.approx(2.0)
-  # Standard is the C3X stock curve below ~40 mph; at >= 45 mph (t312u)
-  # Agg / Std use Relaxed's cap (80% of C3X), blended over 40-45 mph.
-  for v in (0.0, 10.0, 15.0):
-    assert get_max_accel(v) == pytest.approx(c3x_stock(v))
-  assert get_max_accel(0.0) == pytest.approx(1.6)
-  assert get_max_accel(10.0) == pytest.approx(1.2)
-  assert get_max_accel(25.0) == pytest.approx(0.64)
-  assert get_max_accel(40.0) == pytest.approx(0.48)
-  # Relaxed is 80% of that curve at every speed.
-  for v in np.linspace(0.0, 40.0, 21):
-    assert get_max_accel(v, chill_relaxed_mode=True) == pytest.approx(c3x_stock(v) * 0.8)
-  assert get_max_accel(0.0, chill_relaxed_mode=True) == pytest.approx(1.28)
-  assert get_max_accel(25.0, chill_relaxed_mode=True) == pytest.approx(0.64)
-  assert get_max_accel(40.0, chill_relaxed_mode=True) == pytest.approx(0.48)
-  # Aggressive launch: C3X curve + 0.4 at a stop, tapered out by 10 m/s (~22 mph).
-  # The boost is no longer a no-op (Standard at a stop is 1.6, launch is 2.0).
-  assert ChillAggressiveLaunch.accel_extra(0.0) == pytest.approx(0.4)
-  assert get_max_accel(0.0, True) == pytest.approx(2.0)
-  assert get_max_accel(5.0, True) == pytest.approx(1.6)
-  assert get_max_accel(10.0, True) == pytest.approx(1.2)
-  assert get_max_accel(0.0, True) > get_max_accel(0.0)
-  for v in (10.0, 25.0, 40.0):
-    assert get_max_accel(v, True) == pytest.approx(get_max_accel(v))
-  for v in (20.2, 25.0, 40.0):
+  # t314u smooth curves (m/s, cap): gentler than C3X at every speed.
+  assert get_max_accel(0.0) == pytest.approx(1.25)
+  assert get_max_accel(0.0, True) == pytest.approx(1.55)
+  assert get_max_accel(0.0, chill_relaxed_mode=True) == pytest.approx(1.05)
+  assert get_max_accel(10.0) == pytest.approx(0.9533, abs=1e-3)
+  assert get_max_accel(25.0) == pytest.approx(0.5291, abs=1e-3)
+  assert get_max_accel(40.0) == pytest.approx(0.421, abs=1e-3)
+  for v in np.linspace(0.0, 40.0, 81):
+    assert get_max_accel(v, chill_relaxed_mode=True) <= get_max_accel(v) + 1e-9 <= get_max_accel(v, True) + 2e-9
+    assert get_max_accel(v) <= c3x_stock(v) + 1e-9
+    assert get_max_accel(v, chill_relaxed_mode=True) <= 0.8 * c3x_stock(v) + 1e-9
+  # Highway: Agg / Std == Relaxed at >= 50 mph (blend 35-50 mph).
+  for v in (50 * MPH, 25.0, 40.0):
     assert get_max_accel(v) == pytest.approx(get_max_accel(v, chill_relaxed_mode=True))
-  # Mutual exclusion: relaxed scale wins if both flags were ever set (C3X).
-  assert get_max_accel(0.0, True, True) == pytest.approx(1.28)
+    assert get_max_accel(v, True) == pytest.approx(get_max_accel(v, chill_relaxed_mode=True))
+  # Relaxed wins if both flags were ever set (C3X mutual exclusion).
+  assert get_max_accel(0.0, True, True) == pytest.approx(1.05)
 
 
 def test_open_loop_accel_times():
-  # Open-loop integration of the C3X cruise cap. Must match C3X / old test3.
+  # Open-loop integration of the cruise cap (t314u smooth curve).
   t_agg = time_to(lambda v: get_max_accel(v, True), 0, 30)
   t_std = time_to(lambda v: get_max_accel(v), 0, 30)
   t_rel = time_to(lambda v: get_max_accel(v, chill_relaxed_mode=True), 0, 30)
-  assert t_agg == pytest.approx(9.342, abs=0.05)
-  assert t_std == pytest.approx(10.149, abs=0.05)
-  assert t_rel == pytest.approx(12.686, abs=0.05)
-  # Highway (t312u): all three personalities share Relaxed's cap at >= 45 mph.
+  assert t_agg == pytest.approx(11.102, abs=0.05)
+  assert t_std == pytest.approx(12.801, abs=0.05)
+  assert t_rel == pytest.approx(15.111, abs=0.05)
+  assert t_agg < t_std < t_rel
   t75_rel = time_to(lambda v: get_max_accel(v, chill_relaxed_mode=True), 55, 75)
   t75_std = time_to(lambda v: get_max_accel(v), 55, 75)
   t75_agg = time_to(lambda v: get_max_accel(v, True), 55, 75)
-  assert t_agg < t_std < t_rel
-  assert t75_agg == pytest.approx(t75_std)
-  assert t75_std == pytest.approx(t75_rel, abs=0.01)
   assert t75_agg == pytest.approx(t75_rel, abs=0.01)
-  assert t75_rel == pytest.approx(15.014, abs=0.05)
-
+  assert t75_std == pytest.approx(t75_rel, abs=0.01)
+  assert t75_rel == pytest.approx(18.272, abs=0.05)
 
 def test_lead_stop_extra_feet():
   assert get_lead_stop_extra(P.relaxed, False) == pytest.approx(10 * FT)

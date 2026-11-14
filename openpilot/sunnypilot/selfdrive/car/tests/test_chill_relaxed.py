@@ -34,16 +34,16 @@ def test_jerk_and_accel():
   assert get_jerk_factor(P.relaxed, True) == 1.0
   assert get_jerk_factor(P.standard, False) == 1.0
   assert get_jerk_factor(P.aggressive, False) == 0.5
-  # This branch pins Standard to the C3X stock curve; Relaxed is 80% of it.
+  # t314u smooth curves: Standard 1.25 / Relaxed 1.05 at a stop, both
+  # gentler than C3X; Agg/Std == Relaxed at >= 50 mph.
   # Official unpatched sunnypilot/dev is still a flat ACCEL_MAX = 2.0.
   assert ACCEL_MAX == pytest.approx(2.0)
-  assert get_max_accel(0., chill_relaxed_mode=True) == pytest.approx(1.28)
-  assert get_max_accel(25., chill_relaxed_mode=True) == pytest.approx(0.64)
-  assert get_max_accel(40., chill_relaxed_mode=True) == pytest.approx(0.48)
-  assert get_max_accel(0.) == pytest.approx(1.6)
-  # t312u: at highway speed (>= 45 mph) Standard uses Relaxed's cap.
-  assert get_max_accel(25.) == pytest.approx(0.64)
-  assert get_max_accel(15.) == pytest.approx(1.2 - 0.4 * 5. / 15.)
+  assert get_max_accel(0., chill_relaxed_mode=True) == pytest.approx(1.05)
+  assert get_max_accel(25., chill_relaxed_mode=True) == pytest.approx(0.5291, abs=1e-3)
+  assert get_max_accel(40., chill_relaxed_mode=True) == pytest.approx(0.421, abs=1e-3)
+  assert get_max_accel(0.) == pytest.approx(1.25)
+  assert get_max_accel(25.) == pytest.approx(get_max_accel(25., chill_relaxed_mode=True))
+  assert get_max_accel(15.) == pytest.approx(0.7899, abs=1e-3)
 
 
 def test_standstill_gaps_unchanged():

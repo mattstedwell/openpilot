@@ -29,8 +29,10 @@ T_IDXS = np.array(ModelConstants.T_IDXS)
 
 def cap_for(personality, v):
   relaxed = personality == P.relaxed
-  boost = personality == P.aggressive
-  return float(LP.get_max_accel(v, boost and v < 10.0, relaxed))
+  agg = personality == P.aggressive
+  if hasattr(LP, "smooth_accel_cap"):
+    return float(LP.get_max_accel(v, agg, relaxed))
+  return float(LP.get_max_accel(v, agg and v < 10.0, relaxed))
 
 
 def road(R, s_curve=150.0, arc=None, clothoid=40.0):

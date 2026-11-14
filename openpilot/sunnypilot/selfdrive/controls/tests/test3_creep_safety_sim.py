@@ -127,7 +127,10 @@ def run(personality, a_up, v_peak, a_dn, t_end=22.0):
       standstill = ev < 1e-3
       if cal is not None:
         boost = cal.update(True, exp, personality, ev, v_cruise, False)
-        cap = float(LP.get_max_accel(ev, boost, personality == P.relaxed))
+        if hasattr(LP, "smooth_accel_cap"):  # t314u: Agg curve is personality-based
+          cap = float(LP.get_max_accel(ev, personality == P.aggressive, personality == P.relaxed))
+        else:
+          cap = float(LP.get_max_accel(ev, boost, personality == P.relaxed))
       else:
         cap = ACCEL_MAX
       vdf.x = max(0.0, vdf.update(ev))
@@ -171,6 +174,8 @@ def run(personality, a_up, v_peak, a_dn, t_end=22.0):
                     desired_gap=desired_follow_gap(ev, lv, personality, exp))
         a_t = fs.apply(a_t, ev, lead, fcw, 0.05, **kw)
         a_t = float(np.clip(a_t, ACCEL_MIN, cap))
+      if hasattr(LP, "limit_accel_rise"):
+        a_t = float(LP.limit_accel_rise(a_t, a_prev, ev, 0.05))
       out_a = a_t; plan_a = a_t; a_raw_dbg = float(min(a_mpc, a_cruise))
       vdf.x = vdf.x + 0.05 * (out_a + a_prev) / 2.0
     # controls 100 Hz

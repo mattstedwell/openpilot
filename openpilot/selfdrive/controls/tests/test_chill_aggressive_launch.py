@@ -10,22 +10,22 @@ from openpilot.sunnypilot.selfdrive.car.chill_aggressive import ChillAggressiveL
 
 
 def test_launch_accel_curve():
-  # C3X / old test3: Standard is the [1.6, 1.2, 0.8, 0.6] curve; launch is
-  # that curve + 0.4*(1-v/10), so 2.0 at a stop, 1.6 at 5 m/s, 1.2 at 10 m/s.
-  # The boost is no longer a no-op (it was when Standard was a flat 2.0).
+  # t314u: Aggressive's extra low-speed accel is part of its own smooth
+  # curve (keyed on personality, not the launch flag), so there is no step
+  # when the old launch boost used to arm or disarm. The boost helper
+  # still exists but the planner no longer adds it.
   assert ACCEL_MAX == pytest.approx(2.0)
   assert ChillAggressiveLaunch.accel_extra(0.) == pytest.approx(0.4)
-  assert ChillAggressiveLaunch.accel_extra(5.) == pytest.approx(0.2)
   assert ChillAggressiveLaunch.accel_extra(10.) == 0.
-  assert get_max_accel(0., True) == pytest.approx(2.0)
-  assert get_max_accel(5., True) == pytest.approx(1.6)
-  assert get_max_accel(10., True) == pytest.approx(1.2)
-  for speed in np.linspace(10., 45., 30):
-    assert get_max_accel(speed, True) == pytest.approx(get_max_accel(speed))
-  assert get_max_accel(0.) == pytest.approx(1.6)
-  # t312u: Standard == Relaxed at highway speed (25 m/s ~ 56 mph).
-  assert get_max_accel(25.) == pytest.approx(0.64)
-  # Below 10 m/s, launch sits above Standard.
+  assert get_max_accel(0., True) == pytest.approx(1.55)
+  assert get_max_accel(5., True) == pytest.approx(1.3339, abs=1e-3)
+  assert get_max_accel(10., True) == pytest.approx(1.0689, abs=1e-3)
+  assert get_max_accel(0.) == pytest.approx(1.25)
+  # Agg/Std == Relaxed at highway speed (25 m/s ~ 56 mph).
+  assert get_max_accel(25.) == pytest.approx(get_max_accel(25., True))
+  assert get_max_accel(25.) == pytest.approx(0.5291, abs=1e-3)
+  for speed in np.linspace(0., 22., 23):
+    assert get_max_accel(speed, True) >= get_max_accel(speed) - 1e-9
   assert get_max_accel(0., True) > get_max_accel(0.)
   assert get_max_accel(5., True) > get_max_accel(5.)
 

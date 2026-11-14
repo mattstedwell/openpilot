@@ -17,7 +17,8 @@ from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 from openpilot.sunnypilot.selfdrive.car.always_chill import ALWAYS_CHILL, experimental_mode_active
-from openpilot.sunnypilot.selfdrive.car.chill_aggressive import ChillAggressiveLaunch
+from openpilot.sunnypilot.selfdrive.car.chill_aggressive import is_chill_aggressive
+from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_accel_curve import limit_accel_rise, smooth_accel_cap
 from openpilot.sunnypilot.selfdrive.car import chill_relaxed
 from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_curve_comfort import CurveComfort
 
@@ -36,35 +37,32 @@ def get_cruise_accel(v_cruise, v_ego, a_cruise_prev, dt, cap=None):
   return target_accel
 
 
-# C3X / old test3 cruise accel curve. Official sunnypilot/dev stock is a
-# flat ACCEL_MAX = 2.0; this branch pins Standard to the C3X numbers.
+# Previous C3X / old test3 piecewise-linear cruise accel curve, kept for
+# reference and before/after reports only (t314u replaced it with
+# devc4_test3_accel_curve.smooth_accel_cap).
 A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
-HWY_EQUAL_V_START = 40. * CV.MPH_TO_MS  # m/s; Agg/Std start blending to Relaxed's cap
-HWY_EQUAL_V_FULL = 45. * CV.MPH_TO_MS   # m/s; Agg/Std cap == Relaxed's at and above
+HWY_EQUAL_V_START = 35. * CV.MPH_TO_MS  # m/s; Agg/Std start blending to Relaxed's cap (t316u)
+HWY_EQUAL_V_FULL = 50. * CV.MPH_TO_MS   # m/s; Agg/Std cap == Relaxed's at and above (t316u)
 
 
-def get_max_accel(v_ego, chill_aggressive_launch=False, chill_relaxed_mode=False):
-  """Cruise accel ceiling: C3X / old test3 numbers.
+def get_max_accel(v_ego, aggressive=False, chill_relaxed_mode=False):
+  """Positive cruise accel ceiling (m/s²), devc4-test3 t314u.
 
-  Standard is the C3X stock curve [1.6, 1.2, 0.8, 0.6] at [0, 10, 25, 40] m/s,
-  not this tree's official flat ACCEL_MAX=2.0. Chill + Relaxed is 80% of
-  that curve (1.28 / 0.64 / 0.48 at 0 / 25 / 40 m/s). Chill + Aggressive
-  launch adds +0.4 at a stop, tapering out by 10 m/s (~22 mph): 2.0 at a
-  stop, 1.6 at 5 m/s, 1.2 at 10 m/s. The boost is no longer a no-op.
-  Applied as a cap on get_cruise_accel and on the chosen plan.
+  One smooth, monotone (PCHIP, C1) curve per personality, a bit gentler
+  than the old C3X numbers and falling with speed like a fixed fraction
+  of power. Aggressive / Standard blend onto Relaxed's curve over
+  35-50 mph (smootherstep, C2; t316u) and equal it at >= 50 mph (t312u). Aggressive's
+  low-speed extra is built into its own curve. Applied as a cap on
+  get_cruise_accel and on the chosen plan; braking is not capped here.
   """
-  stock = float(np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS))
-  relaxed = stock * chill_relaxed.MAX_ACCEL_SCALE
   if chill_relaxed_mode:
-    return relaxed
-  extra = ChillAggressiveLaunch.accel_extra(v_ego) if chill_aggressive_launch else 0.0
-  own = min(stock + extra, ACCEL_MAX)
-  # t312u: at highway speed Aggressive / Standard use Relaxed's cap,
-  # blended linearly over ~40-45 mph (the Agg launch boost is already 0
-  # above 10 m/s). Positive accel only; braking is not capped here.
-  w = float(np.interp(v_ego, [HWY_EQUAL_V_START, HWY_EQUAL_V_FULL], [0.0, 1.0]))
-  return (1.0 - w) * own + w * relaxed
+    name = "relaxed"
+  elif aggressive:
+    name = "aggressive"
+  else:
+    name = "standard"
+  return min(smooth_accel_cap(v_ego, name), ACCEL_MAX)
 
 
 def choose_acc_plan(a_mpc, source_mpc, stop_mpc, a_cruise, stop_cruise):
@@ -95,7 +93,6 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.a_cruise = init_a
     self.output_a_target = init_a
     self.output_should_stop = False
-    self.chill_aggressive_launch = ChillAggressiveLaunch()
     self.curve_comfort = CurveComfort()
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
@@ -123,12 +120,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # selfdriveState says otherwise, so these Chill-only policies apply.
     personality = sm['selfdriveState'].personality
     exp_mode = experimental_mode_active(getattr(getattr(sm['selfdriveState'], 'deprecated', None), 'experimentalMode', False))
-    enabled = bool(sm['selfdriveState'].enabled)
-    launch_boost = self.chill_aggressive_launch.update(
-      enabled, exp_mode, personality,
-      v_ego, v_cruise if v_cruise_initialized else 0., sm['carState'].brakePressed)
     chill_relaxed_mode = chill_relaxed.is_chill_relaxed(exp_mode, personality)
-    cap = get_max_accel(v_ego, launch_boost, chill_relaxed_mode)
+    cap = get_max_accel(v_ego, is_chill_aggressive(exp_mode, personality), chill_relaxed_mode)
     # devc4-test3 curve comfort (t311u): lower only the positive accel
     # ceiling in curves (current + model-planned lateral accel). Braking
     # is never limited: cap is only the upper clip and stays >= 0.
@@ -199,6 +192,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.output_should_stop = any(s for _, _, s in candidates)
 
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, cap)
+    # t314u: smooth transitions (cruise resume, lead leaving, speed-up):
+    # limit only increases of positive accel (0.6 -> 0.45 m/s³ by speed).
+    # Less accel / more braking is never delayed.
+    if not reset_state:
+      self.output_a_target = limit_accel_rise(self.output_a_target, a_prev, v_ego, self.dt)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 
