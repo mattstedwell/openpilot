@@ -237,18 +237,6 @@ class LongitudinalMpc:
     self.solver = AcadosOcpSolverCython(MODEL_NAME, ACADOS_SOLVER_TYPE, N)
     self.reset()
     self.source = LongitudinalPlanSource.cruise
-    # When True (default), persist a stopping lead's decel and apply a
-    # late reserved extra so the chauffeur taper has room. Sims set
-    # this False for a "before" comparison. Does not change T_FOLLOW
-    # or the official danger factor.
-    self.final_stop_mpc = True
-    # Agg/Std Relaxed-like approach for slowing/stopped leads (t304u).
-    # Relaxed helpers are no-ops so 5ea539 approach is unchanged.
-    # Sims set this False for a "before" (5ea539) comparison.
-    self.lead_slow_mpc = True
-    self._prev_accel_constraint = True
-    self._personality = log.LongitudinalPersonality.standard
-    self._experimental_mode = False
 
   def reset(self):
     self.solver.reset()
@@ -294,9 +282,6 @@ class LongitudinalMpc:
       self.solver.cost_set(i, 'Zl', Zl)
 
   def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard, experimental_mode=True):
-    self._prev_accel_constraint = prev_accel_constraint
-    self._personality = personality
-    self._experimental_mode = experimental_mode
     jerk_factor = get_jerk_factor(personality, experimental_mode)
     a_change_cost = A_CHANGE_COST if prev_accel_constraint else 0
     cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, jerk_factor * a_change_cost, jerk_factor * J_EGO_COST]
@@ -326,20 +311,6 @@ class LongitudinalMpc:
       v_lead = lead.vLead
       a_lead = lead.aLeadK
       a_lead_tau = lead.aLeadTau
-      # Persist a clearly-stopping lead's decel so the plan can start
-      # earlier and the last-5-mph chauffeur taper can stay gentle.
-      if getattr(self, "final_stop_mpc", True):
-        from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_final_stop import (
-          stopping_a_lead_tau)
-        a_lead_tau = stopping_a_lead_tau(v_ego, a_lead, a_lead_tau, v_lead)
-      # Agg/Std: also persist a slowing lead that will not halt
-      # (highway slowdown). Relaxed is a no-op here (t304u).
-      if getattr(self, "lead_slow_mpc", True):
-        from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_lead_slow import (
-          is_relaxed, slowing_a_lead_tau)
-        if not is_relaxed(getattr(self, "_personality", None),
-                          getattr(self, "_experimental_mode", False)):
-          a_lead_tau = slowing_a_lead_tau(v_ego, a_lead, a_lead_tau, v_lead)
     else:
       # Fake a fast lead car, so mpc can keep running in the same mode
       x_lead = 50.0
@@ -359,23 +330,6 @@ class LongitudinalMpc:
   def update(self, radarstate, personality=log.LongitudinalPersonality.standard, experimental_mode=False):
     v_ego = self.x0[1]
     t_follow = get_T_FOLLOW(personality, experimental_mode, v_ego)
-    self._personality = personality
-    self._experimental_mode = experimental_mode
-
-    # Agg/Std facing a slowing/stopped lead: use Relaxed's 1.3 jerk
-    # factor so the MPC solution itself is earlier and gentler.
-    # T_FOLLOW is unchanged. Relaxed is already at 1.3 (no-op).
-    if getattr(self, "lead_slow_mpc", True):
-      from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_lead_slow import (
-        should_use_relaxed_jerk)
-      from openpilot.sunnypilot.selfdrive.car import chill_relaxed
-      if should_use_relaxed_jerk(personality, experimental_mode, radarstate, v_ego):
-        jerk_factor = chill_relaxed.JERK_FACTOR
-        a_change_cost = A_CHANGE_COST if getattr(self, "_prev_accel_constraint", True) else 0
-        cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST,
-                        jerk_factor * a_change_cost, jerk_factor * J_EGO_COST]
-        constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
-        self.set_cost_weights(cost_weights, constraint_cost_weights)
 
     lead_xv_0 = self.process_lead(radarstate.leadOne)
     lead_xv_1 = self.process_lead(radarstate.leadTwo)
@@ -393,22 +347,9 @@ class LongitudinalMpc:
     lead_stop_extra = get_lead_stop_extra(personality, experimental_mode)
     if _present(radarstate.leadOne):
       extra_0 = float(np.interp(lead_xv_0[0, 1], [LEAD_STOP_V_FULL, LEAD_STOP_V_NONE], [lead_stop_extra, 0.0]))
-      # Late reserved extra offsets chauffeur-taper roll so the
-      # planned standstill gap is not eaten; 0 when the stop extra
-      # is already blended out (moving follow unchanged).
-      if extra_0 > 0.0 and getattr(self, "final_stop_mpc", True):
-        from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_final_stop import (
-          taper_comp_shift)
-        extra_0 = extra_0 + taper_comp_shift(v_ego, personality=personality,
-                                             experimental_mode=experimental_mode)
       lead_0_obstacle = lead_0_obstacle - extra_0
     if _present(radarstate.leadTwo):
       extra_1 = float(np.interp(lead_xv_1[0, 1], [LEAD_STOP_V_FULL, LEAD_STOP_V_NONE], [lead_stop_extra, 0.0]))
-      if extra_1 > 0.0 and getattr(self, "final_stop_mpc", True):
-        from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_final_stop import (
-          taper_comp_shift)
-        extra_1 = extra_1 + taper_comp_shift(v_ego, personality=personality,
-                                             experimental_mode=experimental_mode)
       lead_1_obstacle = lead_1_obstacle - extra_1
 
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])

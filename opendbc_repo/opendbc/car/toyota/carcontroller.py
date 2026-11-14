@@ -14,7 +14,6 @@ from opendbc.can import CANPacker
 
 from opendbc.sunnypilot.car.toyota.gas_interceptor import GasInterceptorCarController
 from opendbc.sunnypilot.car.toyota.values import ToyotaFlagsSP, TSS2_SMOOTH_KI
-from opendbc.sunnypilot.car.toyota.smooth_stop_hold import smooth_pcm_accel, fade_stopping_integral
 
 Ecu = structs.CarParams.Ecu
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -271,21 +270,6 @@ class CarController(CarControllerBase, GasInterceptorCarController):
 
         pcm_accel_cmd = pcm_accel_cmd if self.CP.carFingerprint in TSS2_CAR else actuators.accel
         pcm_accel_cmd = float(np.clip(pcm_accel_cmd, self.params.ACCEL_MIN, self.params.ACCEL_MAX))
-
-        # Minimal last-mph / standstill-hold comfort (t301u / t304u):
-        # what reaches the car is this PCM command, after the PID.
-        # Frozen I at the pid→stopping switch is a step on ACCEL_CMD.
-        # Drop that offset and rate-limit at 0.30 m/s³ vs last sent,
-        # only while stopping or in the last ~1 mph, and only for
-        # non-urgent commands. Approach (v ≳ 1 mph, not stopping) is
-        # unchanged, so Relaxed approach braking stays as on 5ea539.
-        # Urgent / emergency keeps the official 4.0 m/s³ path.
-        if CC.longActive:
-          pcm_accel_cmd = smooth_pcm_accel(
-            pcm_accel_cmd, actuators.accel, self.accel, DT_CTRL * 3,
-            stopping, CS.out.vEgo, True)
-          if stopping:
-            fade_stopping_integral(self.long_pid, DT_CTRL * 3)
 
         main_accel_cmd = 0. if self.CP.flags & ToyotaFlags.SECOC.value else pcm_accel_cmd
         can_sends.append(toyotacan.create_accel_command(self.packer, main_accel_cmd, pcm_cancel_cmd, self.permit_braking, self.standstill_req, lead,
