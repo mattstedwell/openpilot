@@ -174,6 +174,13 @@ SCENARIOS = [
   # long pauses: ego reaches standstill in every cycle
   *[S(f"rs_{d}m_3s", rollstop([d] * 8, pauses=(3.0,)), kind="rollstop") for d in (0.5, 1, 2, 5)],
   S("rs_2m_3s_noisy", rollstop([2] * 8, pauses=(3.0,)), kind="rollstop", noise=True),
+  # --- launch performance (Matt t372u: "not launching very quickly" behind a lead pulling
+  # away from a stop). Lead at typical city rates from the set gap; time to 10 / 20 mph.
+  *[S(f"lp_lead_{a}", [("hold", 2.0), ("acc", a, 40 * MPH), ("hold", 6.0)], kind="launchperf")
+    for a in (1.5, 2.0, 2.5)],
+  # lead pulls away, then brakes to a stop again (launch must not ignore a slowing lead)
+  *[S(f"lp_go_then_stop_{a}_{m}mph", [("hold", 2.0), ("acc", a, m * MPH), ("acc", -3.0, 0.0), ("hold", 6.0)],
+      kind="launchstop") for a, m in ((2.5, 10), (2.5, 15), (2.0, 20))],
 ]
 
 
@@ -228,6 +235,8 @@ def SETGAP(p):
 def run(personality, sc, cand):
   exp = False
   cfg = cand.get("human")
+  for _k, _v in (cand.get("hc_consts") or {}).items():   # sim-only constant overrides for tuning sweeps
+    setattr(HC, _k, _v)
   hc = HC.HumanCity(HC.HumanCityConfig(**cfg)) if cfg is not None else None
   hold = HC.LeadHoldover() if (hc is not None and hc.config.lead_holdover) else None
   use_rel = bool(cand.get("release", False) and release_prev_accel is not None)
@@ -286,6 +295,7 @@ def run(personality, sc, cand):
   hw_samples = []; dense_max = 0.0; trace = []
   first_brake_t = None; lead_brake_t = None
   t_end_lead = None
+  t_v10 = t_v20 = None; diag = []
   t_max = 240.0
   while t < t_max:
     lv = lead.step(t, dt_c)
@@ -371,6 +381,11 @@ def run(personality, sc, cand):
         a_t = float(LP.limit_accel_rise(a_t, a_prev, ev, 0.05, jerk=lj))
       except TypeError:  # older trees without the jerk override
         a_t = float(LP.limit_accel_rise(a_t, a_prev, ev, 0.05))
+      if os.environ.get("HCSIM_DIAG") and lead.started is not None and t - lead.started < 6.0:
+        diag.append([round(t - lead.started, 2), round(ev, 2), round(float(rs.leadOne.dRel), 2),
+                     round(follow_gap(ev, float(rs.leadOne.vLead), tf if tf is not None else LM.get_T_FOLLOW(personality, exp, ev)), 2),
+                     round(cap, 2), round(a_mpc, 2), round(a_cruise, 2), round(a_t, 2), lj, int(ss),
+                     round(mpc.launch_margin, 2)])
       out_a = a_t; plan_a = a_t
       vdf.x = vdf.x + 0.05 * (out_a + a_prev) / 2.0
     CS = SimpleNamespace(vEgo=ev, aEgo=ea, brakePressed=False, standstill=ev < 1e-3,
@@ -413,6 +428,11 @@ def run(personality, sc, cand):
     ego_stopped_prev = ego_stopped
     if gap <= 0.0: collided = True
     v_peak = max(v_peak, ev)
+    if lead.started is not None:
+      if t_v10 is None and ev >= 10 * MPH:
+        t_v10 = round(t - lead.started, 2)
+      if t_v20 is None and ev >= 20 * MPH:
+        t_v20 = round(t - lead.started, 2)
     peak_a = max(peak_a, ea_eff); peak_d = min(peak_d, ea_eff)
     ea_hist.append(ea_eff); v_hist.append(ev)
     if len(v_hist) > 6: v_hist.pop(0)
@@ -439,7 +459,7 @@ def run(personality, sc, cand):
               brake_delay_s=None if (first_brake_t is None or lead_brake_t is None) else round(first_brake_t - lead_brake_t, 2),
               v_ego_peak_mph=round(v_peak / MPH, 2), dense_max_s=round(dense_max, 3),
               duration_s=round(t, 1), solve_fail=solve_fail, kind=sc["kind"], set_gap_check=sc["set_gap_check"],
-              trace=trace)
+              t_10mph=t_v10, t_20mph=t_v20, diag=diag, trace=trace)
 
 
 pers = [P.aggressive, P.standard, P.relaxed]
@@ -459,5 +479,5 @@ for p in pers:
           f"min={r['min_gap_m']:6.2f}(set {r['stop_gap_m']}) sgap={r['standstill_gap_minus_stop_gap_m']} "
           f"hw={r['headway_s']} a+={r['peak_accel']:.2f} a-={r['peak_decel']:.2f} jpk={r['peak_jerk']:.2f} "
           f"jrms={r['rms_jerk']:.3f} tmove={r['t_move_mean']} bd={r['brake_delay_s']} fail={r['solve_fail']} "
-          f"dense={r['dense_max_s']}", flush=True)
+          f"dense={r['dense_max_s']} t10={r['t_10mph']} t20={r['t_20mph']}", flush=True)
 OUT.write_text(json.dumps(res, indent=1))

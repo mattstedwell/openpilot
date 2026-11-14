@@ -104,8 +104,23 @@ HOLD_DECEL_MAX = -4.0           # m/s² ... capped here
 # 2010-01-0062). Standard ~ median, ordering kept. Applied as a ceiling
 # only while a lead is present and clearly pulling away with the gap at
 # or above desired; the MPC lead plan still bounds it.
-HUMAN_CAP_BP = (0.0, 15.0 * MPH, 30.0 * MPH)
-HUMAN_CAP = {"aggressive": (1.75, 1.60, 0.0), "standard": (1.50, 1.40, 0.0), "relaxed": (1.30, 1.20, 0.0)}
+# launchboost (Matt t372u, Nov 14 2026: "not launching very quickly" when the
+# lead pulls away; prefers fast response over comfort). In sim the MPC lead
+# plan asked for ~2.0 m/s² from ~1.5 s after the lead moved, but this
+# ceiling (was 1.75/1.50/1.30 at 0 mph, 1.60/1.40/1.20 at 15 mph, gone by
+# 30 mph) and then the personality curve clipped it: that was the real
+# bottleneck 1.5-6 s into the launch. Raised to ~0.2 g (Agg at the
+# openpilot / Toyota / panda 2.0 m/s² limit) and held further up the speed
+# range. Still only a ceiling: the MPC lead plan bounds it, braking passes
+# straight through, and it applies only under the take-up gate below.
+HUMAN_CAP_BP = (0.0, 15.0 * MPH, 30.0 * MPH, 45.0 * MPH)
+HUMAN_CAP = {"aggressive": (2.00, 1.85, 1.30, 0.0), "standard": (1.80, 1.65, 1.15, 0.0),
+             "relaxed": (1.60, 1.45, 1.00, 0.0)}
+# The extra over the personality cap fades out as ego speed comes within
+# LAUNCH_CAP_DV of the lead's speed (a driver eases off as the gap stops
+# opening), so the stronger launch does not overshoot into a lead that holds
+# its speed or brakes right after pulling away (accordion traffic).
+LAUNCH_CAP_DV = 3.0             # m/s
 TAKEUP_A_LEAD_MIN = -0.05
 TAKEUP_V_LEAD_MIN = 0.15
 TAKEUP_GAP_MARGIN = 0.05
@@ -175,6 +190,7 @@ class HumanCityConfig:
   set_gap_gate: bool = True      # launch075: roll-stop gap gate on every launch aid
   launch_margin: float = LAUNCH_MARGIN  # launch075: extra planned lead space after a quick launch, m
   stop_anchor: bool = True        # repeated roll-stop: later stops no closer than the first one
+  launch_cap_dv: float = LAUNCH_CAP_DV  # launchboost: m/s, extra take-up ceiling fades out as ego nears the lead's speed (0 = no fade)
 
 
 DEFAULT_CONFIG = HumanCityConfig()
@@ -402,7 +418,15 @@ class HumanCity:
       sg = _f(set_gap)
       gap_ok = math.isfinite(d) and math.isfinite(sg) and d >= sg - SET_GAP_TOL
     if c.human_launch and gap_ok and takeup_ok(v, lead, desired_gap, fcw) and u <= 0.0:
-      out_cap = max(out_cap, human_launch_cap(v, personality_name))
+      hcap = human_launch_cap(v, personality_name)
+      if c.launch_cap_dv > 0.0 and hcap > out_cap:
+        # ease off the extra take-up accel as we match the lead's speed (a
+        # driver stops pressing once the gap stops opening): no overshoot
+        # into a lead that holds its speed or brakes right after launching
+        dv = _f(getattr(lead, "vLead", float("nan"))) - v
+        w_dv = min(max(dv / c.launch_cap_dv, 0.0), 1.0) if math.isfinite(dv) else 0.0
+        hcap = out_cap + w_dv * (hcap - out_cap)
+      out_cap = max(out_cap, hcap)
       w_lj = 1.0 - _ramp(v, LAUNCH_JERK_V_BP)
       if c.launch_jerk > 0.0 and w_lj > 0.0:
         launch_jerk = w_lj * c.launch_jerk

@@ -158,7 +158,7 @@ def test_holdover_not_for_far_pulling_away_or_bad_lead(last):
 
 def test_human_launch_cap_gated():
   hc = HC.HumanCity(HC.HumanCityConfig(human_launch=True))
-  go = lead(d=12.0, v=2.0, a=1.0)
+  go = lead(d=12.0, v=5.0, a=1.0)   # lead >= LAUNCH_CAP_DV faster than ego: full take-up ceiling
   o = hc.update(1.0, go, "standard", 1.0, 1.45, 1.25, 10.0, False, DT, plan_a_min=0.0)
   assert o.cap == pytest.approx(max(1.25, HC.human_launch_cap(1.0, "standard")))
   for bad in (lead(d=12.0, v=2.0, a=-0.5), lead(d=12.0, v=0.0, a=0.0), lead(d=9.0, v=2.0, a=1.0),
@@ -169,7 +169,80 @@ def test_human_launch_cap_gated():
   assert o.cap == pytest.approx(1.25)
   ordering = [HC.human_launch_cap(0.0, p) for p in PERS]
   assert ordering[0] > ordering[1] > ordering[2]
-  assert HC.human_launch_cap(30 * MPH, "aggressive") == 0.0
+  assert HC.human_launch_cap(45 * MPH, "aggressive") == 0.0
+
+
+# --- launchboost (Matt t372u: stronger launch when the lead pulls away) -------------
+
+def test_launchboost_caps_within_limits_and_ordered():
+  assert [HC.human_launch_cap(0.0, p) for p in PERS] == pytest.approx([2.0, 1.8, 1.6])
+  assert [HC.human_launch_cap(15 * MPH, p) for p in PERS] == pytest.approx([1.85, 1.65, 1.45])
+  for mph in range(0, 60, 2):
+    caps = [HC.human_launch_cap(mph * MPH, p) for p in PERS]
+    assert all(0.0 <= c <= 2.0 for c in caps), (mph, caps)   # openpilot / Toyota / panda ACCEL_MAX
+    assert caps[0] >= caps[1] >= caps[2], (mph, caps)
+  assert HC.HumanCityConfig().launch_cap_dv == pytest.approx(3.0)
+
+
+def test_launchboost_extra_fades_as_ego_matches_lead_speed():
+  base = 1.25
+  full = HC.human_launch_cap(4.0, "standard")
+  caps = []
+  for v_lead in (4.0, 5.0, 5.5, 7.0, 9.0):
+    hc = HC.HumanCity()
+    o = hc.update(4.0, lead(d=30.0, v=v_lead, a=1.0), "standard", 1.0, 1.45, base, 10.0, False, DT, plan_a_min=0.0)
+    caps.append(o.cap)
+  assert caps[0] == pytest.approx(base)                       # at the lead's speed: personality cap only
+  assert caps[1] == pytest.approx(base + (full - base) / 3.0)
+  assert caps[3] == pytest.approx(full) and caps[4] == pytest.approx(full)
+  assert caps == sorted(caps)
+  # fade off -> full ceiling whenever the gate holds
+  hc = HC.HumanCity(HC.HumanCityConfig(launch_cap_dv=0.0))
+  o = hc.update(4.0, lead(d=30.0, v=5.0, a=1.0), "standard", 1.0, 1.45, base, 10.0, False, DT, plan_a_min=0.0)
+  assert o.cap == pytest.approx(full)
+  # never for a braking / stopped lead, inside the set gap, or on FCW
+  for bad, fcw in ((lead(d=30.0, v=9.0, a=-0.5), False), (lead(d=30.0, v=0.0, a=0.0), False),
+                   (lead(d=30.0, v=9.0, a=1.0), True)):
+    hc = HC.HumanCity()
+    o = hc.update(4.0, bad, "standard", 1.0, 1.45, base, 10.0, fcw, DT, plan_a_min=0.0)
+    assert o.cap == pytest.approx(base), bad
+  hc = HC.HumanCity()
+  o = hc.update(0.0, lead(d=7.0, v=2.0, a=1.0), "standard", 1.0, 1.45, base, 6.0, False, DT, plan_a_min=0.0,
+                set_gap=7.52)
+  assert o.cap == pytest.approx(base)
+
+
+# launch075 / 96a69d96a8 sim values (host, before launchboost): time from the lead
+# moving to ego reaching 20 mph, lead accelerating at 2.0 m/s² from the set gap.
+L075_T20_LEAD2 = {"aggressive": 6.90, "standard": 7.62, "relaxed": 8.59}
+
+
+def test_launchboost_closed_loop_faster_pullaway(sims):
+  if ("launch", "aggressive") not in sims:
+    pytest.skip("launch_release not in this tree")
+  for p in PERS:
+    for a in ("1.5", "2.0", "2.5"):
+      r = sims[("launch", p)][f"lp_lead_{a}"]
+      assert not r["collision"] and r["solve_fail"] == 0
+      assert r["min_gap_minus_stop_gap_m"] >= -0.01, (p, a)
+      assert r["t_10mph"] is not None and r["t_20mph"] is not None, (p, a)
+      assert r["peak_accel"] <= HC.human_launch_cap(0.0, p) + 0.05
+      assert 0.55 <= r["t_move_mean"] <= 0.85, (p, a, r["t_move"])   # reaction kept ~0.75 s
+    r = sims[("launch", p)]["lp_lead_2.0"]
+    assert r["t_20mph"] <= L075_T20_LEAD2[p] - 0.4, (p, r["t_20mph"])
+    assert r["peak_accel"] >= HC.human_launch_cap(0.0, p) - 0.3, (p, r["peak_accel"])
+
+
+def test_launchboost_go_then_stop_still_stops_at_set_gap(sims):
+  if ("launch", "aggressive") not in sims:
+    pytest.skip("launch_release not in this tree")
+  for p in PERS:
+    for name, r in sims[("launch", p)].items():
+      if r["kind"] != "launchstop":
+        continue
+      assert not r["collision"] and r["final_gap_m"] > 0.0, (p, name)
+      assert r["stop_gaps_m"], (p, name)
+      assert r["min_gap_minus_stop_gap_m"] >= -0.10, (p, name, r["min_gap_minus_stop_gap_m"])
 
 
 # --- source tripwires ---------------------------------------------------------------
