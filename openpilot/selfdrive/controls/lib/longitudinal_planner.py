@@ -21,6 +21,13 @@ from openpilot.sunnypilot.selfdrive.car.chill_aggressive import is_chill_aggress
 from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_accel_curve import limit_accel_rise, smooth_accel_cap
 from openpilot.sunnypilot.selfdrive.car import chill_relaxed
 from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_curve_comfort import CurveComfort
+from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_safe_launch import (
+  SafeLaunch, desired_follow_gap, launch_gate_ok)
+from openpilot.sunnypilot.selfdrive.controls.lib.devc4_sng import StopAndGo
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_jerk_factor, get_T_FOLLOW, LEAD_DANGER_FACTOR
+
+# dev-c4-sng-test: horizon (first ~2 s) used for the urgency check
+SNG_PLAN_N = int(np.searchsorted(T_IDXS_MPC, 2.0)) + 1
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -94,6 +101,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.output_a_target = init_a
     self.output_should_stop = False
     self.curve_comfort = CurveComfort()
+    self.safe_launch = SafeLaunch()
+    self.sng = StopAndGo()
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
     self.a_desired_trajectory = np.zeros(CONTROL_N)
@@ -146,13 +155,55 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # Get new v_cruise and a_target from Smart Cruise Control and Speed Limit Assist
     v_cruise, self.output_a_target = LongitudinalPlannerSP.update_targets(self, sm, self.v_desired_filter.x, self.output_a_target, v_cruise)
 
+    # devc4-test3 safe launch (t309u): keep official standstill MPC weighting
+    # for the first ~5 mph behind a lead that is clearly pulling away (all
+    # gates), and for the rest of that launch while the lead slows / we
+    # close under ~10 mph so braking builds sooner. Accel is still the MPC
+    # plan; nothing is added to it. self.fcw is the previous frame's.
+    # dev-c4-sng-test: off by default (SngConfig.safe_launch); the quicker
+    # start comes from the Toyota brake-hold release in opendbc instead.
+    lead_one = sm['radarState'].leadOne
+    desired_gap = desired_follow_gap(v_ego, getattr(lead_one, 'vLead', float('nan')), personality, exp_mode)
+    if reset_state:
+      self.safe_launch.reset()
+      self.sng.reset()
+    if self.sng.config.safe_launch:
+      if self.sng.config.safe_launch_brake_free:
+        prev_accel_constraint = self.safe_launch.prev_accel_constraint(
+          prev_accel_constraint, v_ego, lead_one, desired_gap, self.fcw)
+      else:
+        # launch gates only (no change-cost drop for the rest of the launch)
+        prev_accel_constraint = prev_accel_constraint and not launch_gate_ok(v_ego, lead_one, desired_gap, self.fcw)
+
+    # dev-c4-sng-test: automatic stop-and-go / city smoothing (Chill only).
+    # MPC inputs only: Relaxed-style jerk factor (faded out when braking is
+    # urgent), stop gap planned from the lead's predicted stop, higher lead
+    # danger factor / danger-zone cost (keep the set gap), and a lower
+    # positive accel ceiling in stop-and-go. The plan is never raised and
+    # braking is never limited; see devc4_sng.py.
+    jerk_factor, t_follow, danger_cost = None, None, None
+    self.mpc.stop_extra_predicted = 0.0
+    self.mpc.lead_danger_factor = LEAD_DANGER_FACTOR
+    if not exp_mode:
+      sng = self.sng.update(v_ego, lead_one, get_jerk_factor(personality, exp_mode), cap,
+                            smooth_accel_cap(v_ego, "relaxed"), desired_gap, self.output_a_target, self.fcw, self.dt,
+                            base_t_follow=get_T_FOLLOW(personality, exp_mode, self.v_desired_filter.x),
+                            plan_a_min=float(np.min(self.mpc.a_solution[:SNG_PLAN_N])))
+      cap = min(cap, sng.cap)
+      jerk_factor, t_follow, danger_cost = sng.jerk_factor, sng.t_follow, sng.danger_cost
+      self.mpc.stop_extra_predicted = sng.stop_extra_predicted
+      if sng.danger_factor is not None:
+        self.mpc.lead_danger_factor = sng.danger_factor
+      if sng.brake_free:
+        prev_accel_constraint = False
+
     self.mpc.set_weights(prev_accel_constraint, personality=personality,
-                         experimental_mode=exp_mode)
+                         experimental_mode=exp_mode, jerk_factor=jerk_factor, danger_cost=danger_cost)
     if self.CP.openpilotLongitudinalControl:
       self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
     else:
       self.mpc.set_cur_state(v_ego, sm['carState'].aEgo)
-    self.mpc.update(sm['radarState'], personality=personality, experimental_mode=exp_mode)
+    self.mpc.update(sm['radarState'], personality=personality, experimental_mode=exp_mode, t_follow=t_follow)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)

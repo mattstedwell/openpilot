@@ -60,13 +60,14 @@ MATT_CASES = "creep1.5m,creep2.0m,creep3.0m"
 GRID_CASES = "to3mph,to6mph,to10mph"
 
 
-def _run(cases):
+def _run(cases, ablate=""):
   if importlib.util.find_spec("acados") is None:
     pytest.skip("host acados build not available")
   build = Path(os.environ.get("TEST3_MPC_BUILD", "/tmp/test3dev_mpc_build"))
   build.mkdir(parents=True, exist_ok=True)
   out = Path(tempfile.mkdtemp()) / "creep.json"
   env = dict(os.environ)
+  env["SAFE_LAUNCH_ABLATE"] = ablate
   extra = [str(ROOT), str(ROOT / "opendbc_repo"), str(ROOT / "msgq_repo")]
   env["PYTHONPATH"] = os.pathsep.join([p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p] + extra)
   subprocess.run([sys.executable, str(HERE / "test3_creep_safety_sim.py"), str(ROOT), str(build), str(out),
@@ -83,6 +84,21 @@ def matt_results():
 @pytest.fixture(scope="module")
 def grid_results():
   return _run(GRID_CASES)
+
+
+SAFE_LAUNCH_CASES = "creep,to3mph,to6mph,to10mph,launch_up,stopped"
+
+
+@pytest.fixture(scope="module")
+def safe_launch_on():
+  return _run(SAFE_LAUNCH_CASES)
+
+
+@pytest.fixture(scope="module")
+def safe_launch_off():
+  # Same tree with the t309u safe launch (MPC weighting + brake-hold
+  # release) switched off in the sim: that is e9e85baf79 / abab191b19.
+  return _run(SAFE_LAUNCH_CASES, ablate="nompc,nocc")
 
 
 @pytest.mark.parametrize("personality", ["aggressive", "standard", "relaxed"])
@@ -102,3 +118,63 @@ def test_creep_to_city_speed_then_brake_no_collision(grid_results, personality):
     assert not r["collision"], f"{personality} {name}: collision"
     assert r["min_gap_m"] >= 3.5, f"{personality} {name}: min gap {r['min_gap_m']} m"
     assert r["v_ego_peak_mph"] <= r["lead_peak_mph"] + 0.5, f"{personality} {name}: ego {r['v_ego_peak_mph']} mph"
+
+
+# --- t309u safe launch ------------------------------------------------------
+
+@pytest.mark.parametrize("personality", ["aggressive", "standard", "relaxed"])
+def test_safe_launch_never_closer_than_before(safe_launch_on, safe_launch_off, personality):
+  on, off = safe_launch_on[personality], safe_launch_off[personality]
+  for name, r in on.items():
+    if name.startswith("launch_up"):
+      continue
+    assert not r["collision"], f"{personality} {name}: collision"
+    assert r["min_gap_m"] >= off[name]["min_gap_m"] - 0.02, \
+      f"{personality} {name}: min gap {r['min_gap_m']} m vs {off[name]['min_gap_m']} m without safe launch"
+    if not name.startswith("stopped"):
+      assert r["v_ego_peak_mph"] <= r["lead_peak_mph"], f"{personality} {name}: ego out-ran the lead"
+
+
+@pytest.mark.parametrize("personality", ["aggressive", "standard", "relaxed"])
+def test_safe_launch_is_quicker(safe_launch_on, safe_launch_off, personality):
+  on, off = safe_launch_on[personality], safe_launch_off[personality]
+  for name in ("launch_up1.0_to25mph_hold", "launch_up2.0_to25mph_hold"):
+    assert on[name]["t_move_005"] <= off[name]["t_move_005"] - 0.2, (name, on[name]["t_move_005"], off[name]["t_move_005"])
+    # dev-c4 comfort build limits accel build-up (0.45 m/s^3), so reaching
+    # 1 mph gains a little less than on test3. dev-c4-sng-test: SafeLaunch
+    # MPC weighting is off by default (brake-hold release only), which gains
+    # ~0.09-0.2 s to 1 mph; still must be quicker.
+    assert on[name]["t_move_1mph"] <= off[name]["t_move_1mph"] - 0.05, (name, on[name]["t_move_1mph"], off[name]["t_move_1mph"])
+    # Never pushes toward the cap: peak accel no higher than before (+ noise).
+    assert on[name]["peak_accel"] <= off[name]["peak_accel"] + 0.1
+
+
+@pytest.mark.parametrize("personality", ["aggressive", "standard", "relaxed"])
+def test_safe_launch_stopped_lead_never_moves(safe_launch_on, personality):
+  r = safe_launch_on[personality]["stopped_lead_hold"]
+  assert r["t_move_005"] is None and r["v_ego_peak_mph"] == 0.0
+  assert r["min_gap_m"] == pytest.approx(r["gap0_ft"] * 0.3048, abs=0.02)
+
+
+# --- dev-c4-sng-test: StopAndGo + release vs dev-c4 9c6e321c06 ----------------
+
+@pytest.fixture(scope="module")
+def dev_c4_baseline():
+  # No StopAndGo, no SafeLaunch, no brake-hold release: dev-c4 9c6e321c06.
+  return _run(SAFE_LAUNCH_CASES + "," + MATT_CASES, ablate="nosng,nompc,nocc")
+
+
+@pytest.fixture(scope="module")
+def sng_on():
+  return _run(SAFE_LAUNCH_CASES + "," + MATT_CASES)
+
+
+@pytest.mark.parametrize("personality", ["aggressive", "standard", "relaxed"])
+def test_sng_creep_never_closer_or_faster_than_dev_c4(sng_on, dev_c4_baseline, personality):
+  on, off = sng_on[personality], dev_c4_baseline[personality]
+  for name, r in on.items():
+    assert not r["collision"], f"{personality} {name}: collision"
+    assert r["min_gap_m"] >= off[name]["min_gap_m"] - 0.05, (personality, name, r["min_gap_m"], off[name]["min_gap_m"])
+    assert r["peak_accel"] <= off[name]["peak_accel"] + 0.05, (personality, name)
+    if not name.startswith(("stopped", "launch_up")):
+      assert r["v_ego_peak_mph"] <= r["lead_peak_mph"], f"{personality} {name}: ego out-ran the lead"

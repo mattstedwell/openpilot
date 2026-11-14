@@ -60,6 +60,17 @@ FinalStopTaper = try_import("openpilot.sunnypilot.selfdrive.controls.lib.devc4_t
 LeadSlow = try_import("openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_lead_slow", "LeadSlow")
 smooth_pcm_accel = try_import("opendbc.sunnypilot.car.toyota.smooth_stop_hold", "smooth_pcm_accel")
 fade_stopping_integral = try_import("opendbc.sunnypilot.car.toyota.smooth_stop_hold", "fade_stopping_integral")
+import os as _os
+_SL = "openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_safe_launch"
+SafeLaunch = try_import(_SL, "SafeLaunch")
+safe_desired_gap = try_import(_SL, "desired_follow_gap")
+release_prev_accel = try_import("opendbc.sunnypilot.car.toyota.launch_release", "release_prev_accel")
+_ABL = _os.environ.get("SAFE_LAUNCH_ABLATE", "")  # "nompc", "nocc"
+if "nompc" in _ABL: SafeLaunch = None
+if "nocc" in _ABL: release_prev_accel = None
+StopAndGo = try_import("openpilot.sunnypilot.selfdrive.controls.lib.devc4_sng", "StopAndGo")
+smooth_accel_cap = try_import("openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_accel_curve", "smooth_accel_cap")
+if "nosng" in _ABL: StopAndGo = None
 ChillAggressiveLaunch = try_import("openpilot.sunnypilot.selfdrive.car.chill_aggressive", "ChillAggressiveLaunch")
 P = log.LongitudinalPersonality
 LongCtrlState = car.CarControl.Actuators.LongControlState
@@ -74,7 +85,9 @@ def lead_profile(a_up, v_peak, a_dn):
   """Lead starts at t0, accel a_up to v_peak, then a_dn to 0."""
   return a_up, v_peak, a_dn
 
-def run(personality, a_up, v_peak, a_dn, t_end=22.0):
+def run(personality, a_up, v_peak, a_dn, t_end=None):
+  if t_end is None:
+    t_end = 36.0 if v_peak > 12 * MPH and a_dn < 0 else 22.0
   exp = False
   mpc = LM.LongitudinalMpc()
   extra = LM.get_lead_stop_extra(personality, exp) if hasattr(LM, "get_lead_stop_extra") else 0.0
@@ -82,6 +95,8 @@ def run(personality, a_up, v_peak, a_dn, t_end=22.0):
   ll = LeadLaunch() if LeadLaunch else None
   fs = FinalStopTaper() if FinalStopTaper else None
   ls = LeadSlow() if LeadSlow else None
+  sng = StopAndGo() if StopAndGo else None
+  sl = SafeLaunch() if (SafeLaunch and (sng is None or sng.config.safe_launch)) else None
   cal = ChillAggressiveLaunch() if (ChillAggressiveLaunch and hasattr(LP, "get_max_accel")) else None
   CP = SimpleNamespace(stopAccel=-2.0, vEgoStopping=0.25, vEgoStarting=0.25,
                        longitudinalTuning=SimpleNamespace(kiBP=[0.], kiV=[0.]))
@@ -102,19 +117,24 @@ def run(personality, a_up, v_peak, a_dn, t_end=22.0):
   t0 = 3.0
   phase = "wait"; t_lead_brake = None; t_lead_stop = None
   t_ego_move = None; t_first_brake_cmd = None; t_first_brake_plant = None
+  t_req = None; t_move_005 = None; t_move_1mph = None; gap_at_10 = None; peak_a = 0.0; peak_j = 0.0; prev_ea = 0.0
   min_gap = 1e9; peak_dec = 0.0; v_ego_peak = 0.0; collided = False; t_coll = None
-  lead_moved = 0.0; trace = []; a_raw_dbg = 0.0
+  lead_moved = 0.0; trace = []; a_raw_dbg = 0.0; fcw_prev = False
   for k in range(int(t_end / dt_c)):
     t = k * dt_c
     # lead
     if t >= t0 and phase == "wait": phase = "up"
     if phase == "up":
       la_true = a_up
-      if lv >= v_peak: phase = "down"; t_lead_brake = t
+      if lv >= v_peak:
+        if a_dn < 0.0:
+          phase = "down"; t_lead_brake = t
+        else:
+          phase = "hold"; lv = v_peak
     if phase == "down":
       la_true = a_dn
       if lv <= 0.0: phase = "stopped"; t_lead_stop = t
-    if phase in ("wait", "stopped"): la_true = 0.0
+    if phase in ("wait", "stopped", "hold"): la_true = 0.0
     lv = max(0.0, lv + la_true * dt_c)
     if phase == "stopped": lv = 0.0
     lx += lv * dt_c
@@ -134,12 +154,32 @@ def run(personality, a_up, v_peak, a_dn, t_end=22.0):
       else:
         cap = ACCEL_MAX
       vdf.x = max(0.0, vdf.update(ev))
-      if has_kw(mpc.set_weights, "experimental_mode"):
-        mpc.set_weights(not standstill, personality=personality, experimental_mode=exp)
+      pac = not standstill
+      if sl is not None:
+        pac = sl.prev_accel_constraint(pac, ev, rs.leadOne, safe_desired_gap(ev, lv, personality, exp), fcw_prev)
+      jf = tf = None
+      if sng is not None:
+        # dev-c4-sng-test StopAndGo, wired as in longitudinal_planner.py
+        n2 = int(np.searchsorted(LM.T_IDXS, 2.0)) + 1
+        o = sng.update(ev, rs.leadOne, LM.get_jerk_factor(personality, exp), cap, smooth_accel_cap(ev, "relaxed"),
+                       safe_desired_gap(ev, lv, personality, exp), out_a, fcw_prev, 0.05,
+                       base_t_follow=LM.get_T_FOLLOW(personality, exp, vdf.x),
+                       plan_a_min=float(np.min(mpc.a_solution[:n2])))
+        cap = min(cap, o.cap); jf, tf = o.jerk_factor, o.t_follow
+        mpc.stop_extra_predicted = o.stop_extra_predicted
+        mpc.lead_danger_factor = o.danger_factor if o.danger_factor is not None else LM.LEAD_DANGER_FACTOR
+        if o.brake_free:
+          pac = False
+      if sng is not None:
+        mpc.set_weights(pac, personality=personality, experimental_mode=exp, jerk_factor=jf, danger_cost=o.danger_cost)
+      elif has_kw(mpc.set_weights, "experimental_mode"):
+        mpc.set_weights(pac, personality=personality, experimental_mode=exp)
       else:
-        mpc.set_weights(not standstill, personality=personality)
+        mpc.set_weights(pac, personality=personality)
       mpc.set_cur_state(vdf.x, out_a)
-      if has_kw(mpc.update, "experimental_mode"):
+      if sng is not None:
+        mpc.update(rs, personality=personality, experimental_mode=exp, t_follow=tf)
+      elif has_kw(mpc.update, "experimental_mode"):
         mpc.update(rs, personality=personality, experimental_mode=exp)
       else:
         mpc.update(rs, personality=personality)
@@ -157,6 +197,7 @@ def run(personality, a_up, v_peak, a_dn, t_end=22.0):
       a_t = float(np.clip(a_t, ACCEL_MIN, cap))
       lead = rs.leadOne
       fcw = mpc.crash_cnt > 2 and not standstill
+      fcw_prev = fcw
       if ll is not None:
         kw = dict(cap=cap, jerk_up=0.40, v_ego_stopping=0.25)
         if has_kw(ll.apply, "desired_gap"):
@@ -185,6 +226,8 @@ def run(personality, a_up, v_peak, a_dn, t_end=22.0):
     stopping = lc.long_control_state == LongCtrlState.stopping
     # Toyota carcontroller (every 3 frames)
     if k % 3 == 0:
+      if release_prev_accel is not None:
+        prev_accel = release_prev_accel(prev_accel, act, ev, lc.long_control_state == LongCtrlState.pid, True)
       pcm = rate_limit(act, prev_accel, -4.0 * 0.03, 4.0 * 0.03)
       prev_accel = pcm
       prev_ae = aego_f.x; aego_f.update(ea)
@@ -210,11 +253,18 @@ def run(personality, a_up, v_peak, a_dn, t_end=22.0):
     gap = lx - ex
     if t >= t0:
       if t_ego_move is None and ev > 0.1: t_ego_move = t
+      if t_req is None and plan_a > 0.05: t_req = t
+      if t_move_005 is None and ev > 0.05: t_move_005 = t
+      if t_move_1mph is None and ev > MPH: t_move_1mph = t
+      if gap_at_10 is None and t >= t0 + 10.0: gap_at_10 = gap
+      peak_a = max(peak_a, ea)
+      if t <= t0 + 4.0 and ev > 0.0: peak_j = max(peak_j, (ea_eff - prev_ea) / dt_c)
       if t_lead_brake is not None and t >= t_lead_brake:
         if t_first_brake_cmd is None and sent <= -0.5: t_first_brake_cmd = t
         if t_first_brake_plant is None and ea <= -0.5: t_first_brake_plant = t
       min_gap = min(min_gap, gap); peak_dec = min(peak_dec, ea); v_ego_peak = max(v_ego_peak, ev)
       if gap <= 0.0 and not collided: collided = True; t_coll = t
+    prev_ea = ea_eff
     if k % 10 == 0 and t >= t0:
       trace.append([round(t, 2), round(gap, 2), round(lv, 2), round(ev, 2), round(plan_a, 3),
                     round(act, 3), round(sent, 3), round(ea, 3), int(stopping), round(a_raw_dbg, 3)])
@@ -226,6 +276,11 @@ def run(personality, a_up, v_peak, a_dn, t_end=22.0):
               min_gap_m=round(min_gap, 2), min_gap_ft=round(min_gap / FT, 2),
               final_gap_ft=round(gap / FT, 2), collision=collided,
               t_ego_move_after_lead=None if t_ego_move is None else round(t_ego_move - t0, 2),
+              t_req=None if t_req is None else round(t_req - t0, 2),
+              t_move_005=None if t_move_005 is None else round(t_move_005 - t0, 2),
+              t_move_1mph=None if t_move_1mph is None else round(t_move_1mph - t0, 2),
+              gap_at_10s_ft=None if gap_at_10 is None else round(gap_at_10 / FT, 2),
+              peak_accel=round(peak_a, 3), peak_jerk_4s=round(peak_j, 2),
               brake_cmd_delay_s=rel(t_first_brake_cmd), brake_plant_delay_s=rel(t_first_brake_plant),
               peak_decel=round(peak_dec, 3), v_ego_peak_mph=round(v_ego_peak / MPH, 2),
               trace=trace, lead_peak_mph=round(v_peak / MPH, 2))
@@ -238,6 +293,12 @@ for a_up in (0.5, 1.0, 1.5):
   for vp_mph in (3, 6, 10):
     for a_dn in (-1.5, -3.0):
       cases.append((f"up{a_up}_to{vp_mph}mph_dn{a_dn}", a_up, vp_mph * MPH, a_dn))
+for a_up in (0.5, 1.0, 1.5, 2.0):
+  cases.append((f"launch_up{a_up}_to25mph_hold", a_up, 25 * MPH, 0.0))
+cases.append(("stopped_lead_hold", 1.0, 0.0, 0.0))
+# Ordinary stop from city speed (not a low-speed launch episode at the stop).
+for a_dn in (-1.5, -3.0):
+  cases.append((f"stopfrom25mph_up1.0_dn{a_dn}", 1.0, 25 * MPH, a_dn))
 for D in (1.0, 1.5, 2.0, 3.0):
   for a_up, a_dn in ((1.0, -1.5), (1.0, -3.0), (0.5, -1.5)):
     vp = v_peak_for_creep(D, a_up, a_dn)

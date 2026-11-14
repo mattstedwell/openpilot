@@ -234,6 +234,10 @@ def gen_long_ocp():
 class LongitudinalMpc:
   def __init__(self, dt=DT_MDL):
     self.dt = dt
+    self.stop_extra_predicted = 0.0  # dev-c4-sng-test; set by the planner
+    # dev-c4-sng-test: the planner may raise (never lower) the fraction of
+    # the desired distance below which the danger-zone slack applies.
+    self.lead_danger_factor = LEAD_DANGER_FACTOR
     self.solver = AcadosOcpSolverCython(MODEL_NAME, ACADOS_SOLVER_TYPE, N)
     self.reset()
     self.source = LongitudinalPlanSource.cruise
@@ -281,11 +285,17 @@ class LongitudinalMpc:
     for i in range(N):
       self.solver.cost_set(i, 'Zl', Zl)
 
-  def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard, experimental_mode=True):
-    jerk_factor = get_jerk_factor(personality, experimental_mode)
+  def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard, experimental_mode=True,
+                  jerk_factor=None, danger_cost=None):
+    # dev-c4-sng-test: the planner may pass a (blended) jerk factor for
+    # stop-and-go / city smoothing; None keeps the personality's factor.
+    if jerk_factor is None or not np.isfinite(jerk_factor):
+      jerk_factor = get_jerk_factor(personality, experimental_mode)
     a_change_cost = A_CHANGE_COST if prev_accel_constraint else 0
     cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, jerk_factor * a_change_cost, jerk_factor * J_EGO_COST]
-    constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
+    # dev-c4-sng-test: the danger-zone slack cost may only be raised.
+    danger = DANGER_ZONE_COST if danger_cost is None or not np.isfinite(danger_cost) else max(DANGER_ZONE_COST, float(danger_cost))
+    constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, danger]
     self.set_cost_weights(cost_weights, constraint_cost_weights)
 
   def set_cur_state(self, v, a):
@@ -327,9 +337,10 @@ class LongitudinalMpc:
     lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
     return lead_xv
 
-  def update(self, radarstate, personality=log.LongitudinalPersonality.standard, experimental_mode=False):
+  def update(self, radarstate, personality=log.LongitudinalPersonality.standard, experimental_mode=False, t_follow=None):
     v_ego = self.x0[1]
-    t_follow = get_T_FOLLOW(personality, experimental_mode, v_ego)
+    if t_follow is None or not np.isfinite(t_follow):
+      t_follow = get_T_FOLLOW(personality, experimental_mode, v_ego)
 
     lead_xv_0 = self.process_lead(radarstate.leadOne)
     lead_xv_1 = self.process_lead(radarstate.leadTwo)
@@ -345,12 +356,22 @@ class LongitudinalMpc:
     def _present(ld):
       return bool(getattr(ld, "present", False) or getattr(ld, "status", False))
     lead_stop_extra = get_lead_stop_extra(personality, experimental_mode)
+    # dev-c4-sng-test: with stop_extra_predicted > 0 (stop-and-go / city
+    # weight from the planner) the extra also follows the lead's
+    # *predicted* speed along the horizon, so a lead that is braking to a
+    # stop gets the full stop gap planned before it has stopped. max() with
+    # the current-speed extra: this only ever adds space, never removes it.
+    w_pred = float(np.clip(self.stop_extra_predicted, 0.0, 1.0))
+    def _extra(lead_xv):
+      cur = float(np.interp(lead_xv[0, 1], [LEAD_STOP_V_FULL, LEAD_STOP_V_NONE], [lead_stop_extra, 0.0]))
+      if w_pred <= 0.0:
+        return cur
+      pred = np.interp(lead_xv[:, 1], [LEAD_STOP_V_FULL, LEAD_STOP_V_NONE], [lead_stop_extra, 0.0])
+      return cur + w_pred * np.maximum(pred - cur, 0.0)
     if _present(radarstate.leadOne):
-      extra_0 = float(np.interp(lead_xv_0[0, 1], [LEAD_STOP_V_FULL, LEAD_STOP_V_NONE], [lead_stop_extra, 0.0]))
-      lead_0_obstacle = lead_0_obstacle - extra_0
+      lead_0_obstacle = lead_0_obstacle - _extra(lead_xv_0)
     if _present(radarstate.leadTwo):
-      extra_1 = float(np.interp(lead_xv_1[0, 1], [LEAD_STOP_V_FULL, LEAD_STOP_V_NONE], [lead_stop_extra, 0.0]))
-      lead_1_obstacle = lead_1_obstacle - extra_1
+      lead_1_obstacle = lead_1_obstacle - _extra(lead_xv_1)
 
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])
     self.source = MPC_SOURCES[np.argmin(x_obstacles[0])]
@@ -365,7 +386,8 @@ class LongitudinalMpc:
     self.params[:,2] = np.min(x_obstacles, axis=1)
     self.params[:,3] = np.copy(self.a_prev)
     self.params[:,4] = t_follow
-    self.params[:,5] = LEAD_DANGER_FACTOR
+    self.params[:,5] = max(LEAD_DANGER_FACTOR, float(self.lead_danger_factor)) \
+      if np.isfinite(self.lead_danger_factor) else LEAD_DANGER_FACTOR
 
     self.run()
     if (np.any(lead_xv_0[FCW_IDXS,0] - self.x_sol[FCW_IDXS,0] < CRASH_DISTANCE) and
