@@ -18,8 +18,9 @@ from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 from openpilot.sunnypilot.selfdrive.controls.lib.lite_launch import LiteLaunch
-from openpilot.sunnypilot.selfdrive.controls.lib.lite_e2e_stop import shift_e2e_stop
+from openpilot.sunnypilot.selfdrive.controls.lib.lite_e2e_stop import E2eStopState, shift_e2e_stop
 from openpilot.sunnypilot.selfdrive.controls.lib.lite_lead_holdover import LeadHoldover
+from openpilot.sunnypilot.selfdrive.controls.lib.lite_launch_boost import LiteLaunchBoost
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -44,6 +45,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.dt = dt
     self.accel_boost = AccelBoost()
     self.lite_launch = LiteLaunch()
+    self.launch_boost = LiteLaunchBoost()
+    self.e2e_stop_state = E2eStopState()
     self.lead_holdover = LeadHoldover()
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
@@ -123,7 +126,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # lights / stop signs (skipped when a lead explains the stop; the lead
     # MPC already adds 10 ft there). Can only lower accel or add shouldStop.
     output_a_target_e2e, output_should_stop_e2e = shift_e2e_stop(sm['modelV2'], sm['radarState'].leadOne, v_ego,
-                                                                 output_a_target_e2e, output_should_stop_e2e)
+                                                                 output_a_target_e2e, output_should_stop_e2e,
+                                                                 state=self.e2e_stop_state, dt=self.dt)
 
     self.a_cruise = get_cruise_accel(v_cruise, v_ego, self.a_cruise, self.dt)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
@@ -139,13 +143,24 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     # dev-c4-sunnypilot-lite: quicker start once the lead clearly pulls away.
     # Gates re-checked every cycle, nothing latched; see lite_launch.py.
+    # Vision + radar: the model's own lead is only used to AGREE before going
+    # sooner / harder (lite_fusion); stops and holds use leadOne as before.
+    model_leads = sm['modelV2'].leadsV3
+    model_lead = model_leads[0] if len(model_leads) > 0 else None
     if reset_state:
       self.lite_launch.reset()
+      self.launch_boost.reset()
+      self.e2e_stop_state.reset()
     quick_start, output_a_target = self.lite_launch.update(sm['radarState'].leadOne, v_ego, sm['carState'].standstill,
                                                            self.fcw, output_a_target, output_a_target_e2e,
-                                                           output_should_stop_e2e)
+                                                           output_should_stop_e2e, model_lead=model_lead)
     if quick_start:
       self.output_should_stop = False
+    # sunnypilot-lite launchboost: stronger take-up behind a lead pulling away
+    # from a stop (floor only; gates and fades in lite_launch_boost.py).
+    _, output_a_target = self.launch_boost.update(sm['radarState'].leadOne, v_ego, sm['carState'].standstill, self.fcw,
+                                                  sm['selfdriveState'].personality, output_a_target, a_prev, self.dt,
+                                                  output_a_target_e2e, output_should_stop_e2e, model_lead=model_lead)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0

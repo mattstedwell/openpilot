@@ -32,8 +32,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib import lite_e2e_stop as ES  # n
 from opendbc.sunnypilot.car.toyota.launch_release import release_prev_accel, LAUNCH_RELEASE_HOLD  # noqa: E402
 
 
-def lead(d=9.3, v=0.6, a=0.3, present=True):
-  return SimpleNamespace(present=present, dRel=d, vLead=v, aLeadK=a)
+def lead(d=9.3, v=0.6, a=0.3, present=True, radar=True):
+  return SimpleNamespace(present=present, dRel=d, vLead=v, aLeadK=a, radar=radar)
 
 
 class TestLeadStopExtra(unittest.TestCase):
@@ -41,7 +41,7 @@ class TestLeadStopExtra(unittest.TestCase):
     src = (PKG / "selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py").read_text()
     self.assertIn("LEAD_STOP_EXTRA = 10 * 0.3048", src)
     self.assertIn("radarstate.leadOne.present", src)
-    self.assertIn("lead_0_obstacle = lead_0_obstacle - get_lead_stop_extra(lead_xv_0[:,1])", src)
+    self.assertIn("lead_0_obstacle = lead_0_obstacle - get_lead_stop_extra(lead_xv_0[:,1]", src)
     # compiled OCP untouched: STOP_DISTANCE is still official
     self.assertIn("STOP_DISTANCE = 6.0", src)
 
@@ -185,11 +185,12 @@ def run_light(lite, v0=40 * 0.44704, line=120.0, lead_obj=None, t_go=None):
   t = 0.0
   launched = False
   braking = False
+  st = ES.E2eStopState()  # as wired in the planner
   while t < 60.0:
     go = t_go is not None and t >= t_go
     m, a_m, ss_m = model_plan(x, v, line, go=go, braking=braking)
     braking = braking or a_m < 0
-    a_cmd, ss = ES.shift_e2e_stop(m, lead_obj, v, a_m, ss_m)
+    a_cmd, ss = ES.shift_e2e_stop(m, lead_obj, v, a_m, ss_m, state=st, dt=dt)
     if ss or (v < 0.3 and a_cmd < 0.1):  # drive_helpers.should_stop -> longcontrol Stopping
       a_cmd = min(a_cmd, -1.0)
     a_act += (a_cmd - a_act) * (1 - np.exp(-dt / 0.25))

@@ -59,11 +59,44 @@ import os
 TRACE = [float(x) for x in os.environ['SIM_TRACE'].split(',')] if os.environ.get('SIM_TRACE') else None
 if not CAND.get("extra", False):
   LM.LEAD_STOP_EXTRA = 0.0
+  if hasattr(LM, "STOP_TAPER_COMP"):
+    LM.STOP_TAPER_COMP = 0.0
+for _k, _v in CAND.get("lm", {}).items():  # exploratory overrides only
+  setattr(LM, _k, _v)
+try:
+  import openpilot.sunnypilot.selfdrive.controls.lib.lite_fusion as LFmod  # noqa: E402
+except Exception:
+  LFmod = None
+for _k, _v in CAND.get("lf", {}).items():  # exploratory overrides only
+  setattr(LFmod, _k, _v)
+for _k, _v in CAND.get("lc", {}).items():  # exploratory overrides only
+  setattr(LCmod, _k, _v)
 USE_LAUNCH = bool(CAND.get("launch", False) and LL is not None)
 if LL is not None:
   LL.ENABLED = USE_LAUNCH
   for _k, _v in CAND.get("ll", {}).items():  # exploratory overrides only
     setattr(LL, _k, _v)
+try:
+  from openpilot.sunnypilot.selfdrive.controls.lib import lite_launch_boost as LB
+except Exception:
+  LB = None
+USE_BOOST = bool(CAND.get("boost", False) and LB is not None)
+if LB is not None:
+  LB.ENABLED = USE_BOOST
+  for _k, _v in CAND.get("lb", {}).items():  # exploratory overrides only
+    setattr(LB, _k, _v)
+try:
+  from openpilot.sunnypilot.selfdrive.controls.lib import lite_e2e_stop as ES
+except Exception:
+  ES = None
+if ES is not None:
+  for _k, _v in CAND.get("es", {}).items():
+    setattr(ES, _k, _v)
+# "e2e": include an emulated driving-model e2e candidate (desiredAcceleration /
+# shouldStop + a plan for lite_e2e_stop) in the planner min, like the real
+# planner. Scenarios without a "model" spec get a free-road model (non-limiting).
+USE_E2E = bool(CAND.get("e2e", False))
+MODEL_SMOOTH = float(CAND.get("model_smooth", 0.3))  # stock modeld LONG_SMOOTH_SECONDS
 if CAND.get("rel_hold") is not None:
   import opendbc.sunnypilot.car.toyota.launch_release as _LR
   _LR.LAUNCH_RELEASE_HOLD = float(CAND["rel_hold"])
@@ -85,10 +118,17 @@ def eq_gap(p, v):
 
 
 def S(name, segs, ev0=0.0, lv0=0.0, gap0=None, v_cruise=45 * MPH, cut=None, t_tail=10.0, noise=False,
-      lost=None, appear=None, kind="city", headway_mph=None, set_gap_check=True):
+      lost=None, appear=None, kind="city", headway_mph=None, set_gap_check=True, model=None, still=None,
+      t_ref=None, flicker=None, vision=None):
+  # model: list of (t, state, arg) for the emulated driving model (needs CAND e2e):
+  #   ("stop", L) plan a stop at absolute x=L (red light / stop sign line); ("go", A) pull away at A
+  # still: (t0, t1) window where ego must not move (displacement reported)
+  # t_ref: time from which t5/t10/t20 are measured when there is no lead start (e.g. green)
+  # flicker: (t0, t1, on_s, off_s) radar lead present/absent flicker
   return dict(name=name, segs=segs, ev0=ev0, lv0=lv0, gap0=gap0, v_cruise=v_cruise, cut=cut, t_tail=t_tail,
               noise=noise, lost=lost or [], appear=appear, kind=kind, headway_mph=headway_mph,
-              set_gap_check=set_gap_check)
+              set_gap_check=set_gap_check, model=model, still=still, t_ref=t_ref, flicker=flicker,
+              vision=vision, gone_after=None)
 
 
 def accordion(peaks, ups, dns, wait=4.0, hold=2.0):
@@ -160,7 +200,78 @@ SCENARIOS = [
   S("rollstop_0.5m_x10", roll_stop(10, 0.5, 0.8, -1.5, 1.0), kind="rollstop"),
   S("rollstop_5m_x6", roll_stop(6, 5.0, 1.0, -2.0, 3.0), kind="rollstop"),
   S("rollstop_2m_noisy_x8", roll_stop(8, 2.0, 1.0, -2.0, 1.5), noise=True, kind="rollstop"),
+  # --- launchboost (Matt t372u/t374u + "remove the delay from a stop" + "ensure it's still safe")
+  *[S(f"lp_lead_{a}", [("hold", 2.0), ("acc", a, 40 * MPH), ("hold", 6.0)], kind="launchperf")
+    for a in (0.5, 1.0, 1.5, 2.0, 2.5)],
+  # lead pulls away, then brakes to a stop again (incl. beyond-limit -4.5)
+  *[S(f"adv_go_then_brake_{d}_{m}mph", [("hold", 2.0), ("acc", 2.0, m * MPH), ("acc", -d, 0.0), ("hold", 6.0)],
+      kind="adversarial") for d in (3.0, 3.5, 4.5) for m in (5, 10, 20)],
+  # creeping lead, many short cycles (0.5-1 m)
+  *[S(f"adv_creep_{d}m_x8", roll_stop(8, d, 0.8, -1.5, 1.0), kind="rollstop") for d in (0.5, 0.75, 1.0)],
+  S("adv_creep_0.75m_noisy_x8", roll_stop(8, 0.75, 0.8, -1.5, 1.0), noise=True, kind="rollstop"),
+  # radar drops the lead during the launch (and it is braking when it returns)
+  S("adv_lost_during_launch", [("hold", 2.0), ("acc", 2.0, 12 * MPH), ("acc", -3.0, 0.0), ("hold", 6.0)],
+    lost=[(3.2, 3.9)], kind="adversarial"),
+  S("adv_lost_during_launch_late", [("hold", 2.0), ("acc", 1.5, 15 * MPH), ("acc", -3.5, 0.0), ("hold", 6.0)],
+    lost=[(5.0, 5.9)], kind="adversarial"),
+  # cut-in from the adjacent lane while we are launching (slower car, short gap), then it stops
+  *[S(f"adv_cutin_launch_{m}mph", [("hold", 2.0), ("acc", 2.0, 25 * MPH), ("hold", 1.0), ("acc", -3.0, 0.0), ("hold", 6.0)],
+      cut=dict(t=tc, gap=g, v=max(m - 3, 1) * MPH), kind="adversarial", set_gap_check=False)
+    for m, tc, g in ((5, 3.6, 5.0), (10, 4.6, 7.0), (15, 5.6, 9.0))],
+  # flickering / noisy radar lead at standstill: must not creep
+  S("adv_flicker_stopped_lead", [("hold", 15.0)], noise=True, flicker=(1.0, 15.0, 0.25, 0.15), still=(0.0, 15.0),
+    kind="adversarial"),
+  S("adv_flicker_then_launch", [("hold", 4.0), ("acc", 1.5, 20 * MPH), ("hold", 4.0)], noise=True,
+    flicker=(1.0, 6.0, 0.3, 0.1), kind="adversarial"),
 ]
+
+NOLEAD = dict(lost=[(0.0, 1e9)], gap0=500.0)
+LIGHT_L = 40.0  # m: stop line ahead of the start point for the model scenarios
+MODEL_SCENARIOS = [
+  # red light from 25 mph, green at 14 s (model-driven stop, no lead)
+  S("ml_red_then_green", [("hold", 30.0)], ev0=25 * MPH, model=[(0.0, "stop", LIGHT_L), (14.0, "go", 1.5)],
+    t_ref=14.0, still=(9.0, 14.0), kind="model", **NOLEAD),
+  S("ml_red_then_green_gentle", [("hold", 30.0)], ev0=25 * MPH, model=[(0.0, "stop", LIGHT_L), (14.0, "go", 0.6)],
+    t_ref=14.0, still=(9.0, 14.0), kind="model", **NOLEAD),
+  # stop sign: full stop, then the model plans to go 2 s after stopping
+  S("ml_stop_sign", [("hold", 30.0)], ev0=20 * MPH, model=[(0.0, "stop", LIGHT_L), (13.0, "go", 1.2)],
+    t_ref=13.0, still=(10.5, 13.0), kind="model", **NOLEAD),
+  # model stop prediction flickers at a red light: must not creep
+  S("ml_red_flicker", [("hold", 30.0)], ev0=25 * MPH,
+    model=[(0.0, "stop", LIGHT_L)] + sum([[(12.0 + 0.6 * i, "go", 1.0), (12.25 + 0.6 * i, "stop", LIGHT_L)] for i in range(15)], []),
+    still=(9.0, 22.0), kind="model", **NOLEAD),
+  # green, then a pedestrian / stopped car is revealed ahead (radar), model does not see it
+  S("ml_green_then_stopped_obstacle", [("hold", 20.0)], ev0=25 * MPH,
+    model=[(0.0, "stop", LIGHT_L), (14.0, "go", 1.5)], t_ref=14.0, gap0=LIGHT_L - 3.05 + 9.0, appear=14.8,
+    kind="model"),
+  # stop sign, then cross traffic shows up as a ~stationary radar lead just ahead for 2 s
+  S("ml_stop_sign_cross_traffic", [("hold", 20.0)], ev0=20 * MPH,
+    model=[(0.0, "stop", LIGHT_L), (13.0, "go", 1.2)], t_ref=13.0, gap0=LIGHT_L - 3.05 + 7.0, appear=13.3,
+    lost=[(15.3, 1e9)], kind="model"),
+]
+MODEL_SCENARIOS[-1]["gone_after"] = 15.3   # the crossing car has left the lane
+for _sc in MODEL_SCENARIOS:
+  if _sc["lost"] and _sc["lost"][0][0] == 0.0:
+    _sc["gone_after"] = 0.0                  # no physical lead at all
+# vision + radar fusion cases (model lead emulated with 0.2 s lag unless overridden)
+SCENARIOS += [
+  # radar drops the stopped lead at standstill (common low-speed Toyota dropout): must not creep
+  S("fus_radar_dropout_standstill", [("hold", 15.0)], lost=[(2.0, 2.6), (5.0, 6.5), (9.0, 9.4)], still=(0.0, 15.0),
+    kind="fusion", vision=("fallback", 0.0, 1e9)),
+  # same dropouts while the lead creeps and stops (radar gone, vision only, radard-style fallback)
+  S("fus_radar_dropout_creep", [("hold", 2.0), ("dist", 0.8, -1.5, 1.0), ("hold", 2.0), ("dist", 0.8, -1.5, 1.0), ("hold", 6.0)],
+    lost=[(2.2, 3.4), (5.5, 6.8)], kind="fusion", vision=("fallback", 0.0, 1e9)),
+  # radar says the lead pulls away but the model still sees it stopped for 1 s: no early launch
+  S("fus_vision_disagrees", [("hold", 2.0), ("acc", 1.5, 15 * MPH), ("hold", 4.0)], vision=("stopped", 2.0, 3.0),
+    kind="fusion"),
+  # model lead flickers (prob in/out) during a launch
+  S("fus_vision_flicker_launch", [("hold", 2.0), ("acc", 2.0, 20 * MPH), ("acc", -3.0, 0.0), ("hold", 5.0)],
+    vision=("flicker", 1.0, 8.0), kind="fusion"),
+  # vision-only lead (no radar track) pulling away: stock launch only
+  S("fus_vision_only_launch", [("hold", 2.0), ("acc", 1.5, 15 * MPH), ("hold", 4.0)], vision=("only", 0.0, 1e9),
+    kind="fusion"),
+]
+SCENARIOS += MODEL_SCENARIOS
 
 
 class Lead:
@@ -203,9 +314,68 @@ class Lead:
     return self.i >= len(self.segs)
 
 
+class ModelEmu:
+  """Driving-model e2e stand-in: raw accel + a plan (for lite_e2e_stop), modeld-style smoothing."""
+  T = np.array(ModelConstants.T_IDXS)
+
+  def __init__(self, spec, v_cruise):
+    self.spec = spec or []; self.vc = v_cruise; self.a_s = 0.0; self.t_go = None; self.st = "free"
+    self.a_raw = 2.0
+
+  def _plan_acc(self, ev, a):
+    v = np.minimum(np.maximum(ev + a * self.T, 0.0), max(self.vc, ev))
+    x = np.concatenate([[0.0], np.cumsum(np.diff(self.T) * (v[1:] + v[:-1]) / 2.0)])
+    return x, v
+
+  def update(self, t, ex, ev):
+    st, arg = "free", None
+    for te, s_, a_ in self.spec:
+      if t >= te - 1e-9:
+        st, arg = s_, a_
+    if st == "go" and self.st != "go":
+      self.t_go = t
+    self.st = st
+    if st == "free":
+      a_raw = 2.0; x, v = self._plan_acc(ev, a_raw)
+    elif st == "go":
+      a_raw = arg * (1.0 - math.exp(-(t - self.t_go) / 0.5)); x, v = self._plan_acc(ev, a_raw)
+    else:
+      d = arg - ex
+      if ev > 0.3:
+        a_raw = -ev * ev / (2.0 * max(d, 0.3))
+        v = np.maximum(ev + a_raw * self.T, 0.0)
+        x = np.minimum(np.concatenate([[0.0], np.cumsum(np.diff(self.T) * (v[1:] + v[:-1]) / 2.0)]), max(d, 0.0))
+      elif d > 1.0:  # creep up to the line, then stay
+        a_raw = 0.3
+        x = d * (1.0 - np.exp(-self.T / 2.0)); v = (d / 2.0) * np.exp(-self.T / 2.0)
+      else:
+        a_raw = -0.2; x = np.zeros_like(self.T); v = np.zeros_like(self.T)
+    self.a_raw = a_raw
+    alpha = 1.0 - math.exp(-0.05 / MODEL_SMOOTH) if MODEL_SMOOTH > 0 else 1.0
+    self.a_s = self.a_s + alpha * (a_raw - self.a_s)
+    ss_m = bool(ev < 0.3 and a_raw < 0.1)
+    return SimpleNamespace(position=SimpleNamespace(x=list(x), t=list(self.T)), velocity=SimpleNamespace(x=list(v)),
+                           action=SimpleNamespace(desiredAcceleration=float(self.a_s), shouldStop=ss_m))
+
+
+def LINE_OF(sc):
+  for _, s_, a_ in (sc["model"] or []):
+    if s_ == "stop":
+      return a_
+  return None
+
+
+def _call_launch(launch, *args, model_lead=None):
+  try:
+    return launch.update(*args, model_lead=model_lead)
+  except TypeError:
+    return launch.update(*args)
+
+
 def run(personality, sc):
   use_rel = bool(CAND.get("release", False) and release_prev_accel is not None)
   mpc = LM.LongitudinalMpc()
+  es_state = ES.E2eStopState() if (ES is not None and hasattr(ES, 'E2eStopState')) else None
   g_stop = stop_target()
   ev = sc["ev0"]; lv = sc["lv0"]
   gap0 = sc["gap0"] if sc["gap0"] is not None else (g_stop if lv < 0.1 else eq_gap(personality, lv))
@@ -215,6 +385,15 @@ def run(personality, sc):
                        longitudinalTuning=SimpleNamespace(kiBP=[0.], kiV=[0.]))
   lc = LCmod.LongControl(CP, SimpleNamespace(enableGasInterceptor=False))
   launch = LL.LiteLaunch() if USE_LAUNCH else None
+  boost = LB.LiteLaunchBoost() if USE_BOOST else None
+  model = ModelEmu(sc["model"], sc["v_cruise"]) if USE_E2E else None
+  use_fusion = bool(CAND.get("fusion", True))
+  vis_hist = []
+  t_ref = sc["t_ref"]; t_clear = None; t_move_clear = None; t_move_ref = None
+  tv = {}; t_launch0 = None
+  still_x0 = None; still_disp = 0.0
+  stop_hist = []; stop_comfort = []
+  boost_on = 0
   hold = LeadHoldover() if (CAND.get("holdover", False) and LeadHoldover is not None) else None
   pid = PIDController(0.0, ([2., 5.], [0.5, 0.25]), k_f=1.0, pos_limit=2.0, neg_limit=-3.5, rate=1 / 0.03)
   aego_f = FirstOrderFilter(0.0, 0.25, 0.03)
@@ -225,12 +404,21 @@ def run(personality, sc):
   lx = gap0; la_f = 0.0; tau_f = 1.5
   out_a = 0.0; plan_a = 0.0; ss = ev < 0.3; a_cruise = 0.0; prev_accel = 0.0; sent = 0.0
   quick = False
-  delay = [0.0] * 5
+  delay = [0.0] * int(sc.get("plant_delay_n", 5))
+  p_tau = float(sc.get("plant_tau", 0.25)); b_tau = float(sc.get("brake_release_tau") or p_tau)
 
   def visible(t):
     if sc["appear"] is not None and t < sc["appear"] + 1e-9 and sc["appear"] > 0:
       return False
+    fl = sc["flicker"]
+    if fl is not None and fl[0] <= t < fl[1] and ((t - fl[0]) % (fl[2] + fl[3])) >= fl[2]:
+      return False
     return not any(a <= t < b for a, b in sc["lost"])
+
+  def physical(t):
+    if sc["appear"] is not None and sc["appear"] > 0 and t < sc["appear"]:
+      return False
+    return sc.get("gone_after") is None or t < sc["gone_after"]
   if ev > 0.1 and sc["appear"] is None:
     for _ in range(40):
       mpc.set_weights(True, personality=personality)
@@ -267,6 +455,8 @@ def run(personality, sc):
         hold_end.append((round(lx - ex, 2), round(ev / MPH, 2)))
       if ev < 0.05:
         t_lead_start = t
+        if t_launch0 is None:
+          t_launch0 = t
     if t_lead_start is not None and ev > 0.01 and t_first_pending is None:
       t_first_pending = t_lead_start
       firsts.append(round(t - t_lead_start, 3))
@@ -280,6 +470,7 @@ def run(personality, sc):
       else:
         tau_f += (0.0 - tau_f) * (0.05 / (0.45 + 0.05))
       vis = visible(t)
+      vis_hist.append((t, lv, gap, physical(t)))
       if sc["noise"]:
         rs = HM.radar(gap + rng.normal(0, 0.15), max(lv + rng.normal(0, 0.15), 0.0), la_f + rng.normal(0, 0.3),
                       tau=tau_f, present=vis)
@@ -287,6 +478,26 @@ def run(personality, sc):
         rs = HM.radar(gap, lv, la_f, tau=tau_f, present=vis)
       if vis:
         rs.leadOne.vRel = float(lv - ev)
+      # emulated model lead (vision): 0.2 s behind the truth, prob 0.9 while the lead is physically there
+      model_lead = None
+      if use_fusion:
+        old = [h for h in vis_hist if h[0] <= t - 0.2]
+        h = old[-1] if old else vis_hist[0]
+        prob = 0.9 if h[3] else 0.0
+        mv = h[1]
+        vs = sc["vision"]
+        if vs is not None and vs[1] <= t < vs[2]:
+          if vs[0] == "stopped":
+            mv = 0.0
+          elif vs[0] == "flicker":
+            prob = prob if int((t - vs[1]) / 0.2) % 2 == 0 else 0.0
+        model_lead = SimpleNamespace(prob=prob, x=[h[2] + 1.52], v=[mv], a=[0.0])
+        if vs is not None and vs[0] == "fallback" and not rs.leadOne.present and prob > 0.5:
+          rs = HM.radar(h[2], mv, 0.0, tau=0.3, present=True)
+          rs.leadOne.radar = False
+          rs.leadOne.vRel = float(mv - ev)
+        if vs is not None and vs[0] == "only" and vs[1] <= t < vs[2] and rs.leadOne.present:
+          rs.leadOne.radar = False
       standstill = ev < 1e-3
       vdf.x = max(0.0, vdf.update(ev))
       mpc.set_weights(not standstill, personality=personality)
@@ -307,12 +518,27 @@ def run(personality, sc):
       ss_mpc = should_stop(ev, a_mpc)
       a_cruise = LP.get_cruise_accel(v_cruise, ev, a_cruise, 0.05)
       ss_cruise = should_stop(ev, a_cruise)
-      a_t = float(np.clip(min(a_mpc, a_cruise), ACCEL_MIN, ACCEL_MAX))
-      ss = ss_mpc or ss_cruise
+      a_e2e = None; ss_e2e = False
+      if model is not None:
+        m = model.update(t, ex, ev)
+        a_e2e = m.action.desiredAcceleration; ss_e2e = m.action.shouldStop
+        if ES is not None:
+          if es_state is not None:
+            a_e2e, ss_e2e = ES.shift_e2e_stop(m, rs.leadOne, ev, a_e2e, ss_e2e, state=es_state, dt=0.05)
+          else:
+            a_e2e, ss_e2e = ES.shift_e2e_stop(m, rs.leadOne, ev, a_e2e, ss_e2e)
+        if t_ref is not None and t >= t_ref and t_clear is None and model.a_raw >= 0.1:
+          t_clear = t
+      a_t = float(np.clip(min(a_mpc, a_cruise, a_e2e if a_e2e is not None else 9.0), ACCEL_MIN, ACCEL_MAX))
+      ss = ss_mpc or ss_cruise or ss_e2e
       if launch is not None:
-        quick, a_t = launch.update(rs.leadOne, ev, standstill, fcw, a_t, None, False)
+        quick, a_t = _call_launch(launch, rs.leadOne, ev, standstill, fcw, a_t, a_e2e, ss_e2e, model_lead=model_lead)
         if quick:
           ss = False
+      if boost is not None:
+        on, a_t = boost.update(rs.leadOne, ev, standstill, fcw, personality, a_t, a_prev, 0.05, a_e2e, ss_e2e,
+                               model_lead=model_lead)
+        boost_on += int(on)
       out_a = a_t; plan_a = a_t
       vdf.x = vdf.x + 0.05 * (out_a + a_prev) / 2.0
     CS = SimpleNamespace(vEgo=ev, aEgo=ea, brakePressed=False, standstill=ev < 1e-3,
@@ -334,14 +560,41 @@ def run(personality, sc):
       print(f"TR t={t:5.2f} lv={lv:5.2f} gap={lx-ex:6.2f} a_plan={plan_a:6.3f} ss={int(ss)} st={int(lc.long_control_state)} "
             f"act={act:6.3f} prev={prev_accel:6.3f} sent={sent:6.3f} ea={ea:6.3f} ev={ev:5.3f} q={int(quick)}")
     delay.append(sent); d = delay.pop(0)
-    ea = ea + (d - ea) * (1 - math.exp(-dt_c / 0.25))
+    tau_now = b_tau if (ea < 0.0 and d > ea) else p_tau  # releasing the brake can be slower
+    ea = ea + (d - ea) * (1 - math.exp(-dt_c / tau_now))
     ea_eff = 0.0 if (ev <= 0.0 and ea < 0.0) else ea
     ev = max(0.0, ev + ea_eff * dt_c)
     ex += ev * dt_c
     gap = lx - ex
-    if lv < 0.01 and ev > 0.05 and gap < g_stop:
+    if lv < 0.01 and ev > 0.05 and gap < g_stop and physical(t):
       ego_moved_while_lead_stopped = max(ego_moved_while_lead_stopped, ev)
-    if not (cut and not cut_done):
+    t0v = t_ref if t_ref is not None else t_launch0
+    if t0v is not None and t >= t0v:
+      for mph in (5, 10, 20):
+        if mph not in tv and ev >= mph * MPH:
+          tv[mph] = round(t - t0v, 2)
+      if t_move_ref is None and ev > 0.1:
+        t_move_ref = round(t - t0v, 2)
+    if t_clear is not None and t_move_clear is None and ev > 0.1:
+      t_move_clear = round(t - t_clear, 2)
+    st_w = sc["still"]
+    if st_w is not None and st_w[0] <= t < st_w[1]:
+      if still_x0 is None:
+        still_x0 = ex
+      still_disp = max(still_disp, ex - still_x0)
+    stop_hist.append((t, ea_eff, ev))
+    if len(stop_hist) > 260:
+      stop_hist.pop(0)
+    if len(stop_hist) > 220 and ev < 0.01 and stop_hist[-2][2] >= 0.01:
+      w = [h for h in stop_hist if h[0] >= t - 2.0]
+      a_w = [h[1] for h in w]
+      js = [abs(a_w[i] - a_w[i - 5]) / 0.05 for i in range(5, len(a_w) - 1)]  # rolling, excludes the stop instant
+      prof = {f"{dt_:.1f}": round(float(np.interp(t - dt_, [h[0] for h in w], a_w)), 3) for dt_ in (2.0, 1.5, 1.0, 0.5, 0.2)}
+      stop_comfort.append(dict(t=round(t, 2), gap=round(gap, 2) if physical(t) else None,
+                               line_gap=round(LINE_OF(sc) - ex, 2) if LINE_OF(sc) is not None else None, peak_jerk_roll=round(max(js) if js else 0.0, 3),
+                               a_at_stop=round(a_w[-2], 3), stop_step_jerk=round(abs(a_w[-2]) / 0.05, 2),
+                               peak_decel=round(min(a_w), 3), prof=prof))
+    if not (cut and not cut_done) and physical(t):
       min_gap = min(min_gap, gap)
       if lv < 0.05 and ev < 0.05:
         min_gap_stop_rel = min(min_gap_stop_rel, gap - g_stop)
@@ -349,7 +602,7 @@ def run(personality, sc):
     if ego_stopped and not ego_stopped_prev and lv < 0.05:
       stop_gaps.append(round(gap, 2))
     ego_stopped_prev = ego_stopped
-    if gap <= 0.0:
+    if gap <= 0.0 and physical(t):
       collided = True
     peak_a = max(peak_a, ea_eff); peak_d = min(peak_d, ea_eff)
     ea_hist.append(ea_eff); v_hist.append(ev)
@@ -372,9 +625,15 @@ def run(personality, sc):
               t_move_max=round(float(max(moves)), 3) if moves else None,
               headway_s=round(float(np.mean(hw_samples)), 3) if hw_samples else None,
               max_v_inside_target_lead_stopped=round(ego_moved_while_lead_stopped, 3),
-              duration_s=round(t, 1), solve_fail=solve_fail, kind=sc["kind"], set_gap_check=sc["set_gap_check"])
+              duration_s=round(t, 1), solve_fail=solve_fail, kind=sc["kind"], set_gap_check=sc["set_gap_check"],
+              t_5mph=tv.get(5), t_10mph=tv.get(10), t_20mph=tv.get(20), t_move_ref=t_move_ref,
+              t_clear=None if t_clear is None or t_ref is None else round(t_clear - t_ref, 2), t_move_after_clear=t_move_clear,
+              still_disp_m=round(still_disp, 3) if sc["still"] is not None else None, stop_comfort=stop_comfort,
+              boost_cycles=boost_on)
 
 
+if os.environ.get("SIM_NO_MAIN"):
+  raise SystemExit(0)
 only = set(sys.argv[5].split(",")) if len(sys.argv) > 5 and sys.argv[5] else None
 subs = sys.argv[6].split(",") if len(sys.argv) > 6 and sys.argv[6] else None
 res = {"tree": str(TREE), "candidate": CAND, "cases": {}}
@@ -390,5 +649,7 @@ for p in (P.aggressive, P.standard, P.relaxed):
     print(f"{CAND.get('name', '?'):6s} {PNAME[p]:10s} {sc['name']:36s} coll={int(r['collision'])} "
           f"min={r['min_gap_m']:6.2f}(tgt {r['stop_target_m']}) sgap-tgt={r['standstill_gap_minus_target_m']} "
           f"stops={r['stop_gaps_m'][:10]} hold_end={r['hold_end_gap_m'][:10]} hw={r['headway_s']} a+={r['peak_accel']:.2f} a-={r['peak_decel']:.2f} "
-          f"jpk={r['peak_jerk']:.2f} t1={r['t_first_motion']} tmove={r['t_move']} fail={r['solve_fail']}", flush=True)
+          f"jpk={r['peak_jerk']:.2f} t1={r['t_first_motion']} tmove={r['t_move']} fail={r['solve_fail']} "
+          f"t5/10/20={r['t_5mph']}/{r['t_10mph']}/{r['t_20mph']} tclr={r['t_clear']} tmvclr={r['t_move_after_clear']} "
+          f"still={r['still_disp_m']} boost={r['boost_cycles']}", flush=True)
 OUT.write_text(json.dumps(res, indent=1))

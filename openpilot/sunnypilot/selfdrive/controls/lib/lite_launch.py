@@ -30,6 +30,8 @@ Not road-tested.
 """
 from __future__ import annotations
 
+from openpilot.sunnypilot.selfdrive.controls.lib.lite_fusion import conservative_gap, lead_moving_agreed
+
 ENABLED = True
 
 V_LEAD_MIN = 0.25     # m/s: lead must really be rolling (not radar noise)
@@ -60,21 +62,25 @@ class LiteLaunch:
     self.d_ref = None
     self.count = 0
 
-  def gate(self, lead, v_ego: float, fcw: bool, a_target: float) -> bool:
+  def gate(self, lead, v_ego: float, fcw: bool, a_target: float, model_lead=None) -> bool:
     if not (lead is not None and lead.present):
       return False
+    # vision + radar: radar-measured lead, model agrees it moves (or has no lead)
+    if not lead_moving_agreed(lead, model_lead):
+      return False
     v_lead = float(lead.vLead)
+    d = conservative_gap(lead, model_lead)
     return (v_ego < LAUNCH_V_MAX and
             v_lead >= V_LEAD_MIN and
             v_lead - v_ego >= V_REL_MIN and
             float(lead.aLeadK) >= A_LEAD_MIN and
-            float(lead.dRel) >= stop_target() - GAP_TOL and
+            d >= stop_target() - GAP_TOL and
             self.d_ref is not None and float(lead.dRel) >= self.d_ref + MOVED_MIN and
             not fcw and
             a_target > A_PLAN_MIN)
 
   def update(self, lead, v_ego: float, standstill: bool, fcw: bool, a_target: float,
-             a_e2e: float | None = None, e2e_should_stop: bool = False) -> tuple[bool, float]:
+             a_e2e: float | None = None, e2e_should_stop: bool = False, model_lead=None) -> tuple[bool, float]:
     """Returns (quick_start, a_target). a_target is never lowered."""
     if not ENABLED:
       self.reset()
@@ -88,7 +94,7 @@ class LiteLaunch:
     if v_ego >= LAUNCH_V_MAX or not lead_present:
       self.armed = False
       self.d_ref = None
-    ok = bool(self.armed and not e2e_should_stop and self.gate(lead, v_ego, fcw, a_target))
+    ok = bool(self.armed and not e2e_should_stop and self.gate(lead, v_ego, fcw, a_target, model_lead))
     self.count = self.count + 1 if ok else 0
     self.active = self.count >= CONFIRM_N
     if not self.active:

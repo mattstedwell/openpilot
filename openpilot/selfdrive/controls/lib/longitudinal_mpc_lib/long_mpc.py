@@ -65,6 +65,14 @@ MIN_X_LEAD_FACTOR = 0.5
 LEAD_STOP_EXTRA = 10 * 0.3048  # m (3.048)
 LEAD_STOP_EXTRA_V_FULL = 0.5   # m/s
 LEAD_STOP_EXTRA_V_NONE = 5.0   # m/s (~11 mph)
+# sunnypilot-lite-test smooth final stop: longcontrol's softer finish (STOP_SMOOTH)
+# rolls a few cm farther than the stock grab, so stops that follow a real approach
+# (ego above STOP_COMP_V_MIN since it last pulled away) aim STOP_TAPER_COMP
+# farther back. It stays on while stopped and drops when the car pulls away again,
+# so creeps / roll-stop cycles see the unchanged target. 0.0 = off.
+STOP_TAPER_COMP = 0.15         # m
+STOP_COMP_V_MIN = 2.0          # m/s (matches longcontrol STOP_SOFT_V_MIN)
+STOP_COMP_MOVING_V = 0.05      # m/s
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
@@ -90,9 +98,10 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
 def get_stopped_equivalence_factor(v_lead):
   return (v_lead**2) / (2 * COMFORT_BRAKE)
 
-def get_lead_stop_extra(v_lead):
+def get_lead_stop_extra(v_lead, comp=0.0):
   """Extra standstill gap (m) for a lead at speed v_lead (scalar or array)."""
-  return np.interp(v_lead, [LEAD_STOP_EXTRA_V_FULL, LEAD_STOP_EXTRA_V_NONE], [LEAD_STOP_EXTRA, 0.0])
+  full = LEAD_STOP_EXTRA + comp if LEAD_STOP_EXTRA > 0.0 else 0.0
+  return np.interp(v_lead, [LEAD_STOP_EXTRA_V_FULL, LEAD_STOP_EXTRA_V_NONE], [full, 0.0])
 
 def get_safe_obstacle_distance(v_ego, t_follow):
   return (v_ego**2) / (2 * COMFORT_BRAKE) + t_follow * v_ego + STOP_DISTANCE
@@ -281,7 +290,17 @@ class LongitudinalMpc:
     constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
     self.set_cost_weights(cost_weights, constraint_cost_weights)
 
+  def update_stop_comp(self, v):
+    """Latch: real approach (v >= STOP_COMP_V_MIN) -> comp until the car pulls away again."""
+    stopped = v < STOP_COMP_MOVING_V
+    if not stopped and getattr(self, '_comp_was_stopped', True):
+      self.comp_v_peak = 0.0  # pulled away: new trip
+    self.comp_v_peak = max(getattr(self, 'comp_v_peak', 0.0), float(v))
+    self._comp_was_stopped = stopped
+    return STOP_TAPER_COMP if self.comp_v_peak >= STOP_COMP_V_MIN else 0.0
+
   def set_cur_state(self, v, a):
+    self.stop_comp = self.update_stop_comp(v)
     v_prev = self.x0[1]
     self.x0[1] = v
     self.x0[2] = a
@@ -334,9 +353,9 @@ class LongitudinalMpc:
     # dev-c4-sunnypilot-lite: +10 ft standstill gap behind a present lead,
     # per prediction step (a lead predicted to stop gets the full extra there).
     if radarstate.leadOne.present:
-      lead_0_obstacle = lead_0_obstacle - get_lead_stop_extra(lead_xv_0[:,1])
+      lead_0_obstacle = lead_0_obstacle - get_lead_stop_extra(lead_xv_0[:,1], getattr(self, 'stop_comp', 0.0))
     if radarstate.leadTwo.present:
-      lead_1_obstacle = lead_1_obstacle - get_lead_stop_extra(lead_xv_1[:,1])
+      lead_1_obstacle = lead_1_obstacle - get_lead_stop_extra(lead_xv_1[:,1], getattr(self, 'stop_comp', 0.0))
 
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])
     self.source = MPC_SOURCES[np.argmin(x_obstacles[0])]

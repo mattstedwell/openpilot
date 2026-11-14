@@ -99,5 +99,6 @@ def radar(d, v, a, tau=1.5, present=True):
   if present:
     ld.dRel = float(d); ld.vLead = float(v); ld.vLeadK = float(v); ld.aLeadK = float(a)
     ld.aLeadTau = float(tau); ld.modelProb = 1.0; ld.vRel = 0.0
+    ld.radar = True
   rs.leadTwo.present = False
   return rs
