@@ -152,6 +152,7 @@ class UIState(UIStateSP):
     self._update_state()
     self._update_status()
     self._update_chestnut_state()
+    UIStateSP.update_calibration_screen_hold(self)
     device.update()
     UIStateSP.update(self)
 
