@@ -12,6 +12,16 @@ class Paths:
     return os.path.join(str(Path.home()), ".comma" + os.environ.get("OPENPILOT_PREFIX", ""))
 
   @staticmethod
+  def params() -> str:
+    # Must match C++ Path::params() in common/hardware/hw.h.
+    if "PARAMS_ROOT" in os.environ:
+      return os.environ["PARAMS_ROOT"]
+    elif PC:
+      return os.path.join(Paths.comma_home(), "params")
+    else:
+      return "/data/params"
+
+  @staticmethod
   def log_root() -> str:
     if os.environ.get('LOG_ROOT', False):
       return os.environ['LOG_ROOT']

@@ -3,6 +3,7 @@ import numpy as np
 import pyray as rl
 from collections.abc import Callable
 from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.common.swaglog import cloudlog
 from openpilot.common.qrcode import make_texture
 from openpilot.system.ui.lib.application import FontWeight, gui_app, TextAlignment
 from openpilot.system.ui.widgets import Widget
@@ -266,15 +267,31 @@ class TrainingGuide(NavWidget):
     self._steps = [
       TrainingGuideAttentionNotice(continue_callback=lambda: gui_app.push_widget(self._steps[1])),
       TrainingGuidePreDMTutorial(continue_callback=lambda: gui_app.push_widget(self._steps[2])),
-      TrainingGuideDMTutorial(continue_callback=lambda: gui_app.push_widget(self._steps[3])),
-      TrainingGuideRecordFront(continue_callback=completed_callback),
+      # devc4-test2: the "driver camera data" (RecordFront) page is skipped, as
+      # if "no, don't upload" were chosen: manager startup stores RecordFront
+      # = False when it was never set, and an explicit earlier choice (or a
+      # later opt-in in Settings > Toggles) is left alone.
+      TrainingGuideDMTutorial(continue_callback=completed_callback),
+      TrainingGuideRecordFront(continue_callback=completed_callback),  # kept, no longer pushed
     ]
 
     self._child(self._steps[0])
     self._steps[0].set_enabled(lambda: self.enabled and not self.is_dismissing)  # for nav stack
 
+    # devc4-test2: skip the "what is sunnypilot?" notice (no Next tap needed).
+    # Like OnboardingWindow, the push is deferred to _render (not show_event)
+    # to avoid the nested push_widget re-enable issue.
+    self._auto_skip_attention_notice = True
+
+  def show_event(self):
+    super().show_event()
+    self._auto_skip_attention_notice = True
+
   def _render(self, _):
     self._steps[0].render(self._rect)
+    if self._auto_skip_attention_notice and self.enabled and not self.is_dismissing:
+      self._auto_skip_attention_notice = False
+      gui_app.push_widget(self._steps[1])
 
 
 class QRCodeWidget(Widget):
@@ -348,6 +365,29 @@ class OnboardingWindow(Widget):
 
     self._needs_initial_push = False
 
+    # devc4-test2: the training guide (driver monitoring intro + face check) is
+    # never shown during onboarding. Manager startup already stores
+    # CompletedTrainingVersion = training_version; this covers the case where
+    # it did not land. If the write fails here too, the official guide is
+    # shown as a fallback so the device is never left un-engageable silently.
+    if not self._training_done:
+      self._mark_training_done()
+
+  def _mark_training_done(self) -> bool:
+    try:
+      ui_state.params.put("CompletedTrainingVersion", training_version, block=True)
+      self._training_done = True
+    except Exception as err:
+      cloudlog.exception(f"devc4-test2: auto-complete training guide failed: {err}")
+    return self._training_done
+
+  def _skip_or_show_training(self):
+    """devc4-test2: finish onboarding without the DM intro / DM check pages."""
+    if self._training_done or self._mark_training_done():
+      self.close()
+    else:
+      gui_app.push_widget(self._training_guide)
+
   def _on_uninstall(self):
     ui_state.params.put_bool("DoUninstall", True, block=True)
 
@@ -377,32 +417,23 @@ class OnboardingWindow(Widget):
     self._accepted_terms = True
     if not self._sunnylink_consent_done:
       gui_app.push_widget(self._sunnylink_consent)
-    elif not self._training_done:
-      gui_app.push_widget(self._training_guide)
     else:
-      self.close()
+      self._skip_or_show_training()
 
   def _on_sunnylink_accepted(self):
     ui_state.params.put("CompletedSunnylinkConsentVersion", sunnylink_consent_version, block=True)
     ui_state.params.put_bool("SunnylinkEnabled", True)
     self._sunnylink_consent_done = True
-    if not self._training_done:
-      gui_app.push_widget(self._training_guide)
-    else:
-      self.close()
+    self._skip_or_show_training()
 
   def _on_sunnylink_declined(self):
     ui_state.params.put("CompletedSunnylinkConsentVersion", sunnylink_consent_declined, block=True)
     ui_state.params.put_bool("SunnylinkEnabled", False)
     self._sunnylink_consent_done = True
-    if not self._training_done:
-      gui_app.push_widget(self._training_guide)
-    else:
-      self.close()
+    self._skip_or_show_training()
 
   def _on_completed_training(self):
-    ui_state.params.put("CompletedTrainingVersion", training_version, block=True)
-    self._training_done = True
+    self._mark_training_done()
     self.close()
 
   def _render(self, _):
@@ -414,6 +445,6 @@ class OnboardingWindow(Widget):
       if self._accepted_terms and not self._sunnylink_consent_done:
         gui_app.push_widget(self._sunnylink_consent)
       elif self._accepted_terms and self._sunnylink_consent_done and not self._training_done:
-        gui_app.push_widget(self._training_guide)
+        gui_app.push_widget(self._training_guide)  # devc4-test2: only if auto-complete failed
 
     self._terms.render(self._rect)

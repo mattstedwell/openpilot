@@ -21,6 +21,8 @@ from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware.hw import Paths
 
 from openpilot.sunnypilot.system.params_migration import run_migration
+from openpilot.sunnypilot.system.devc4_listed_defaults import apply_listed_defaults, apply_toggle_defaults
+from openpilot.sunnypilot.system.devc4_auto_onboarding import apply_auto_onboarding
 
 
 def manager_init() -> None:
@@ -57,6 +59,26 @@ def manager_init() -> None:
     default_value = params.get_default_value(k)
     if default_value is not None and params.get(k) is None:
       params.put(k, default_value, block=True)
+
+  # Listed defaults for this branch: ALC 0.5 s + BSM delay, and on-road
+  # Screen Off after 3 s. Official compiled defaults stay official in
+  # params_keys.h; apply via this path for those existing keys only.
+  # Missing ALC/screen keys are filled; official stored ALC/screen defaults
+  # are migrated once. Later user settings are not overwritten. SSH, ADB,
+  # and ChevronInfo are not filled or migrated.
+  apply_listed_defaults(params)
+
+  # dev-c4-sunnypilot-lite: Road Edge lane-change block, Blendful and SCC
+  # Vision on once per device (the official loop above already stored the
+  # prebuilt off default, so fill-missing alone cannot turn them on).
+  apply_toggle_defaults(params)
+
+  # devc4-test2: terms auto-accepted (HasAcceptedTerms/HasAcceptedTermsSP kept
+  # at the current versions every boot) and sunnylink enabled once (one-time
+  # flag; a later Settings "off" is respected), driver camera data sharing
+  # declined if never set, and the training guide (driver monitoring intro +
+  # face check) marked complete at the current training_version. Never raises.
+  apply_auto_onboarding(params)
 
   # Create folders needed for msgq
   try:

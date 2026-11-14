@@ -66,6 +66,7 @@ class UIStateSP:
     self.custom_torque_params: bool = False
     self.torque_override_enabled: bool = False
     self._sp_initialized: bool = False
+    self._onroad_timer_saved = None  # remaining countdown while PAUSED
 
   def update(self) -> None:
     if self.sunnylink_enabled:
@@ -73,30 +74,65 @@ class UIStateSP:
     else:
       self.sunnylink_state.stop()
 
+  @staticmethod
+  def _alert_is_critical(alert) -> bool:
+    """Red take-control-immediately alerts only.
+
+    Both the mici (~line 235) and big (~line 121) alert renderers pass an
+    Alert whose `status` is `selfdriveState.alertStatus.raw` (int). Compare
+    against the enum and its raw value so either form matches.
+    """
+    if alert is None:
+      return False
+    status = getattr(alert, "status", None)
+    if status is None:
+      return False
+    critical = log.SelfdriveState.AlertStatus.critical
+    raw = int(getattr(critical, "raw", critical))
+    try:
+      return status == critical or int(status) == raw
+    except (TypeError, ValueError):
+      return False
+
   def onroad_brightness_handle_alerts(self, _ui_state, alert):
     if _ui_state.sm.recv_frame["carState"] < _ui_state.started_frame:
       return
 
-    has_alert = _ui_state.started and self.onroad_brightness != OnroadBrightness.AUTO and alert is not None
+    # Non-critical alerts (including the personality/profile-change popup)
+    # must not freeze the inactivity countdown: always tick while running.
+    self.update_onroad_brightness()
 
-    self.update_onroad_brightness(has_alert)
-    if has_alert:
+    # Only a critical (red take-control-immediately) alert restarts the timer.
+    if (_ui_state.started and self.onroad_brightness != OnroadBrightness.AUTO
+        and self._alert_is_critical(alert)):
       self.reset_onroad_sleep_timer()
 
-  def update_onroad_brightness(self, has_alert: bool) -> None:
-    if has_alert:
-      return
-
+  def update_onroad_brightness(self) -> None:
     if self.onroad_brightness_timer > 0:
       self.onroad_brightness_timer -= 1
 
   def reset_onroad_sleep_timer(self, timer_status: OnroadTimerStatus = OnroadTimerStatus.NONE) -> None:
-    # Toggling from active state to inactive
-    if timer_status == OnroadTimerStatus.PAUSE and self.onroad_brightness_timer != ONROAD_BRIGHTNESS_TIMER_PAUSED:
-      self.onroad_brightness_timer = ONROAD_BRIGHTNESS_TIMER_PAUSED
-    # Toggling from a previously inactive state or resetting an active timer
-    elif (self.onroad_brightness_timer_param >= 0 and self.onroad_brightness != OnroadBrightness.AUTO and
-          self.onroad_brightness_timer != ONROAD_BRIGHTNESS_TIMER_PAUSED) or timer_status == OnroadTimerStatus.RESUME:
+    # Hide the driving view: freeze the remaining countdown so it does not
+    # expire under the settings page, and so RESUME can continue it.
+    if timer_status == OnroadTimerStatus.PAUSE:
+      if self.onroad_brightness_timer != ONROAD_BRIGHTNESS_TIMER_PAUSED:
+        self._onroad_timer_saved = self.onroad_brightness_timer
+        self.onroad_brightness_timer = ONROAD_BRIGHTNESS_TIMER_PAUSED
+      return
+
+    # Return to the driving view: unpause and continue from the saved
+    # remainder. Do not write the full timeout — that was waking the screen.
+    # If we were not paused, leave the current countdown alone.
+    if timer_status == OnroadTimerStatus.RESUME:
+      if self.onroad_brightness_timer == ONROAD_BRIGHTNESS_TIMER_PAUSED:
+        saved = self._onroad_timer_saved
+        self.onroad_brightness_timer = 0 if saved is None else saved
+        self._onroad_timer_saved = None
+      return
+
+    # Full reset (touch, critical alert, first param init). Unchanged.
+    if (self.onroad_brightness_timer_param >= 0 and self.onroad_brightness != OnroadBrightness.AUTO and
+        self.onroad_brightness_timer != ONROAD_BRIGHTNESS_TIMER_PAUSED):
       if self.onroad_brightness == OnroadBrightness.AUTO_DARK:
         self.onroad_brightness_timer = 15 * gui_app.target_fps
       else:
