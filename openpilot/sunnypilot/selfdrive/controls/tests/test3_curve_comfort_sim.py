@@ -54,6 +54,7 @@ def drive(personality, R, v0, v_set, use_curve, t_end=40.0, dt=0.05):
   out = dict(peak_long_at_lat1=0.0, peak_total=0.0, peak_lat=0.0, v_curve_mph=None, exit_jerk=0.0,
              peak_long_in_curve=0.0, peak_jerk=0.0)
   prev_a = 0.0
+  a_out = 0.0
   tr = []
   for i in range(int(t_end / dt)):
     t = i * dt
@@ -65,6 +66,9 @@ def drive(personality, R, v0, v_set, use_curve, t_end=40.0, dt=0.05):
       cap = cc.update(cap, v, k_now, yaw, vplan, T_IDXS, dt)
     a_cruise = LP.get_cruise_accel(v_set, v, a_cruise, dt, cap=cap)
     a_cmd = float(np.clip(a_cruise, -3.5, cap))
+    if hasattr(LP, "limit_accel_rise"):  # t314u planner rise limit
+      a_cmd = float(LP.limit_accel_rise(a_cmd, a_out, v, dt))
+    a_out = a_cmd
     for _ in range(5):
       a += (a_cmd - a) * (1 - np.exp(-0.01 / 0.25))
       v = max(0.0, v + a * 0.01)

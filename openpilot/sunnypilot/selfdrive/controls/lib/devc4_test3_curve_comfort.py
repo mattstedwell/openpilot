@@ -11,8 +11,8 @@ friction-circle style comfort budget:
   a_long_max(lat) = min(sqrt(A_TOTAL_MAX² - lat²),
                         interp(lat, [LAT_TAPER_START, LAT_ZERO], [A_TOTAL_MAX, 0]))
 
-so total accel stays under ~1.8 m/s² and longitudinal accel tapers to 0
-as lateral accel reaches ~1.6 m/s². `lat` is the larger of the current
+so total accel stays under ~1.6 m/s² and longitudinal accel tapers to 0
+as lateral accel reaches ~1.4 m/s² (t317u; was 1.8 / 1.6). `lat` is the larger of the current
 lateral accel (v² · controlsState.curvature) and the lateral accel the
 model's planned path predicts over the next few seconds, scaled to
 ego's speed (so it does not accelerate *into* a curve or mid-curve).
@@ -28,12 +28,12 @@ import math
 
 import numpy as np
 
-A_TOTAL_MAX = 1.8        # m/s²; friction-circle budget (long + lat)
-LAT_TAPER_START = 0.6    # m/s²; below this lateral accel, only the circle applies
-LAT_ZERO = 1.6           # m/s²; longitudinal accel ceiling reaches 0 here
+A_TOTAL_MAX = 1.6        # m/s²; friction-circle budget (long + lat); t317u: was 1.8
+LAT_TAPER_START = 0.5    # m/s²; below this lateral accel, only the circle applies; t317u: was 0.6
+LAT_ZERO = 1.4           # m/s²; longitudinal accel ceiling reaches 0 here; t317u: was 1.6
 LOOKAHEAD_T = 3.0        # s; how far along the model plan to look for a curve
 MIN_PLAN_V = 1.0         # m/s; guards curvature = yaw_rate / v at low speed
-CAP_FALL_JERK = 1.5      # m/s³; how fast the ceiling may drop (curve ahead)
+CAP_FALL_JERK = 1.0      # m/s³; how fast the ceiling may drop (curve ahead); t317u: was 1.5
 CAP_RISE_JERK = 0.4      # m/s³; how fast the ceiling recovers (curve exit)
 
 
