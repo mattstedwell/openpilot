@@ -322,3 +322,22 @@ def test_launch_build_human_start_and_accel(sims):
       r = sims[("launch", p)][name]
       assert r["t_move_mean"] <= 1.15, (p, name)       # human ~1.04-1.08 s
       assert r["peak_accel"] <= HC.human_launch_cap(0.0, p) + 0.05
+
+
+# --- LAUNCH CHANGE branch (dev-c4-human-launch) -------------------------------------
+def test_launch_branch_defaults_human_launch_on():
+  assert HC.HumanCityConfig().human_launch is True
+
+
+def test_release_prev_accel_only_releases_standstill_hold():
+  from opendbc.sunnypilot.car.toyota.launch_release import release_prev_accel
+  # standstill, pid, positive request: deep hold -> light hold
+  assert release_prev_accel(-2.0, 0.5, 0.0, True, True) == pytest.approx(-0.3)
+  # braking request untouched
+  assert release_prev_accel(-2.0, -0.5, 0.0, True, True) == -2.0
+  # moving: untouched
+  assert release_prev_accel(-2.0, 0.5, 3.0, True, True) == -2.0
+  # still in stopping state (not pid): untouched
+  assert release_prev_accel(-2.0, 0.5, 0.0, False, True) == -2.0
+  # not long active: untouched
+  assert release_prev_accel(-2.0, 0.5, 0.0, True, False) == -2.0

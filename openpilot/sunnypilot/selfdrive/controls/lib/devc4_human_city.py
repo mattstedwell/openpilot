@@ -123,7 +123,7 @@ class HumanCityConfig:
   lead_holdover: bool = True
   boost_rate_up: float = BOOST_RATE_UP
   boost_on_decel: bool = True
-  human_launch: bool = False     # LAUNCH CHANGE (planner ceiling); off unless Matt approves
+  human_launch: bool = True      # LAUNCH CHANGE (planner ceiling); dev-c4-human-launch only, needs Matt review
 
 
 DEFAULT_CONFIG = HumanCityConfig()

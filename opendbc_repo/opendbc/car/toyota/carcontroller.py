@@ -13,6 +13,7 @@ from opendbc.car.toyota.values import CAR, NO_STOP_TIMER_CAR, TSS2_CAR, \
 from opendbc.can import CANPacker
 
 from opendbc.sunnypilot.car.toyota.gas_interceptor import GasInterceptorCarController
+from opendbc.sunnypilot.car.toyota.launch_release import release_prev_accel
 from opendbc.sunnypilot.car.toyota.values import ToyotaFlagsSP, TSS2_SMOOTH_KI
 
 Ecu = structs.CarParams.Ecu
@@ -217,6 +218,11 @@ class CarController(CarControllerBase, GasInterceptorCarController):
         # internal PCM gas command can get stuck unwinding from negative accel so we apply a generous rate limit
         pcm_accel_cmd = actuators.accel
         if CC.longActive:
+          # devc4-test3 (t309u): at a standstill, once longcontrol has left
+          # Stopping with a positive request, drop the deep hold to a light
+          # hold in one step. Braking requests are untouched.
+          self.prev_accel = release_prev_accel(self.prev_accel, actuators.accel, CS.out.vEgo,
+                                               actuators.longControlState == LongCtrlState.pid, CC.longActive)
           pcm_accel_cmd = rate_limit(pcm_accel_cmd, self.prev_accel, ACCEL_WINDDOWN_LIMIT, ACCEL_WINDUP_LIMIT)
         self.prev_accel = pcm_accel_cmd
 
