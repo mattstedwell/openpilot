@@ -196,3 +196,50 @@ def apply_listed_defaults(params, flag_path: str | None = None) -> bool:
   # Only mark complete if the flag actually landed.
   _mark_migrated(flag_path)
   return migrated
+
+
+# ---------------------------------------------------------------------------
+# dev-c4-test (ported from dev-c4-sunnypilot-lite 61db6a002d): one-time ON for RoadEdge / Blendful / SCC Vision.
+#
+# Fill-missing alone never reaches the device for these three: manager_init's
+# official "set unset params to their default value" loop runs first and
+# stores the prebuilt libparams_c.so compiled default (False), so by the time
+# apply_listed_defaults runs the key is no longer missing. This one-time step
+# turns them on once if they are still at the official off value, then writes
+# its own flag (beside d/, like MIGRATION_FLAG_NAME). A later Settings "off"
+# is respected because the flag is already present.
+TOGGLE_DEFAULTS_ON = ("RoadEdgeLaneChangeEnabled", "Blendful", "SmartCruiseControlVision")
+# Own flag name: a device that already ran the lite flag still gets this once.
+TOGGLE_FLAG_NAME = "devc4_test_toggle_defaults_v1"
+
+
+def default_toggle_flag_path() -> str:
+  return os.path.join(_paths().params(), TOGGLE_FLAG_NAME)
+
+
+def apply_toggle_defaults(params, flag_path: str | None = None) -> bool:
+  """Once per device: set TOGGLE_DEFAULTS_ON keys True if missing or off.
+
+  Returns True if anything was written this call. Flag filesystem errors are
+  logged and skipped (no write, no claim of completion).
+  """
+  if flag_path is None:
+    try:
+      flag_path = default_toggle_flag_path()
+    except OSError as err:
+      _log_flag_oserror("resolve path", "<toggle flag path>", err)
+      return False
+
+  present = _flag_already_present(flag_path)
+  if present is None or present:
+    return False
+
+  changed = False
+  for key in TOGGLE_DEFAULTS_ON:
+    if params.get(key) in (None, False, 0):
+      _put(params, key, True)
+      changed = True
+
+  _mark_migrated(flag_path)
+  return changed
+

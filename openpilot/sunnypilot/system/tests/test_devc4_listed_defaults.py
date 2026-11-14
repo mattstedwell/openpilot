@@ -450,3 +450,72 @@ class TestFillMissingToggles(unittest.TestCase):
       self.assertIs(p.d["RoadEdgeLaneChangeEnabled"], True)
       self.assertIs(p.d["SmartCruiseControlVision"], True)
       self.assertIs(p.d["Blendful"], False)  # user-stored value left alone
+
+
+class TestToggleDefaultsOnce(unittest.TestCase):
+  """dev-c4-test (ported from dev-c4-sunnypilot-lite 61db6a002d): RoadEdge / Blendful / SCC Vision reach the device.
+
+  Simulates manager_init order on the device: the official loop stores the
+  prebuilt libparams_c.so compiled default (False) first, then
+  apply_listed_defaults, then apply_toggle_defaults.
+  """
+  KEYS = ("RoadEdgeLaneChangeEnabled", "Blendful", "SmartCruiseControlVision")
+
+  class _P:
+    def __init__(self, d): self.d = dict(d)
+    def get(self, k): return self.d.get(k)
+    def put(self, k, v, block=True): self.d[k] = v
+
+  def _boot(self, p, d):
+    from openpilot.sunnypilot.system.devc4_listed_defaults import apply_toggle_defaults
+    for k in self.KEYS:  # official "set unset params to default" with prebuilt "0"
+      if p.get(k) is None:
+        p.put(k, False)
+    apply_listed_defaults(p, flag_path=os.path.join(d, "listed"))
+    return apply_toggle_defaults(p, flag_path=os.path.join(d, "toggles"))
+
+  def test_fresh_device_gets_toggles_on_despite_prebuilt_off_default(self):
+    with tempfile.TemporaryDirectory() as d:
+      p = self._P({})
+      self.assertTrue(self._boot(p, d))
+      for k in self.KEYS:
+        self.assertIs(p.d[k], True, k)
+
+  def test_existing_device_with_official_off_is_turned_on_once(self):
+    with tempfile.TemporaryDirectory() as d:
+      p = self._P({k: False for k in self.KEYS})
+      self._boot(p, d)
+      for k in self.KEYS:
+        self.assertIs(p.d[k], True, k)
+
+  def test_later_user_off_is_respected(self):
+    with tempfile.TemporaryDirectory() as d:
+      p = self._P({})
+      self._boot(p, d)
+      p.put("Blendful", False)  # user turns it off in Settings
+      self.assertFalse(self._boot(p, d))
+      self.assertIs(p.d["Blendful"], False)
+      self.assertIs(p.d["RoadEdgeLaneChangeEnabled"], True)
+
+  def test_flag_failure_does_not_write(self):
+    from openpilot.sunnypilot.system.devc4_listed_defaults import apply_toggle_defaults
+    orig = defaults_mod._flag_already_present
+    defaults_mod._flag_already_present = lambda _p: None
+    try:
+      p = self._P({k: False for k in self.KEYS})
+      self.assertFalse(apply_toggle_defaults(p, flag_path="/nonexistent/x"))
+      for k in self.KEYS:
+        self.assertIs(p.d[k], False)
+    finally:
+      defaults_mod._flag_already_present = orig
+
+  def test_manager_calls_toggle_defaults_after_official_loop(self):
+    src = MANAGER.read_text()
+    loop = src.index("set unset params to their default value")
+    self.assertGreater(src.index("apply_toggle_defaults(params)"), loop)
+    self.assertGreater(src.index("apply_listed_defaults(params)"), loop)
+
+
+  def test_own_flag_name(self):
+    self.assertEqual(defaults_mod.TOGGLE_FLAG_NAME, "devc4_test_toggle_defaults_v1")
+    self.assertNotEqual(defaults_mod.TOGGLE_FLAG_NAME, defaults_mod.MIGRATION_FLAG_NAME)

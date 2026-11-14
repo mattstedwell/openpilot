@@ -21,7 +21,7 @@ from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware.hw import Paths
 
 from openpilot.sunnypilot.system.params_migration import run_migration
-from openpilot.sunnypilot.system.devc4_listed_defaults import apply_listed_defaults
+from openpilot.sunnypilot.system.devc4_listed_defaults import apply_listed_defaults, apply_toggle_defaults
 from openpilot.sunnypilot.system.devc4_auto_onboarding import apply_auto_onboarding
 
 
@@ -67,6 +67,12 @@ def manager_init() -> None:
   # are migrated once. Later user settings are not overwritten. SSH, ADB,
   # and ChevronInfo are not filled or migrated.
   apply_listed_defaults(params)
+
+  # dev-c4-test (from dev-c4-sunnypilot-lite 61db6a002d): Road Edge lane-change
+  # block, Blendful and SCC Vision on once per device. The official loop above
+  # already stored the prebuilt libparams_c.so off default, so fill-missing
+  # alone never turns them on. Own flag; a later Settings "off" is respected.
+  apply_toggle_defaults(params)
 
   # devc4-test2: terms auto-accepted (HasAcceptedTerms/HasAcceptedTermsSP kept
   # at the current versions every boot) and sunnylink enabled once (one-time
