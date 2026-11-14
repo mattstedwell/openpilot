@@ -154,6 +154,61 @@ STOP_ANCHOR_V_MOVED = 0.3       # m/s, ego rolled since the last stop (a new sto
 STOP_ANCHOR_A_LEAD = -0.2       # m/s², lead counts as slowing
 STOP_ANCHOR_AIM = 0.15          # m, planned beyond the first stop (MPC stop overshoot is ~0.1-0.2 m)
 
+# --- dev-c4-test2: lead matching (Matt: track the lead's accel) ------------
+# Accel matching: when the lead accelerates (aLeadK >= LM_A_ON), is not
+# much slower than us, the gap is >= the desired gap and >= the set
+# stopping distance (roll-stop gap gate) and there is no FCW, the MPC is
+# told the lead keeps accelerating (aLeadTau <= LM_TAU instead of the
+# radard 1.5 that predicts the accel dying out) and the planned accel may
+# rise at LM_JERK. Still min(MPC, cruise) and the personality ceiling.
+# Brake matching (lm_brake, OFF): predicting a braking lead to keep braking
+# (aLeadTau <= LM_TAU) was tried; in the closed-loop sim it left 3-11 cm
+# LESS gap in hard-brake / lost-lead stops, so it is off. Braking response
+# comes from the MPC's own aLeadK prediction plus branch launch075's
+# firmer low-speed brake build-up.
+LM_A_ON = 0.2                   # m/s²
+LM_BRAKE_A = -0.3               # m/s²
+LM_TAU = 0.3                    # 1/s² in a(t) = a0*exp(-tau*t²/2)
+LM_JERK = 2.0                   # m/s³ rise rate while accel matching
+LM_CLOSING_MAX = 0.5            # m/s; v_ego - v_lead above this -> no accel matching
+LM_V_MIN = 6.0                  # m/s (~13 mph); below this the launch logic owns take-up (stop-and-go)
+# Cut-in recovery: a lead that newly appears (or the lead distance drops
+# by >= CUTIN_D_JUMP in one step) inside the desired gap, not braking and
+# not closing fast, is backed off gently for up to CUTIN_WINDOW s: the
+# planned decel may only deepen at CUTIN_JERK and not below CUTIN_FLOOR.
+# Ends at once on FCW, urgency, TTC < CUTIN_TTC_MIN, a braking cut-in
+# (aLeadK < CUTIN_A_LEAD_MIN), d < CUTIN_D_MIN or once the gap is back.
+CUTIN_D_JUMP = 3.0              # m
+CUTIN_WINDOW = 4.0              # s
+CUTIN_JERK = 1.0                # m/s³
+CUTIN_FLOOR = -1.5              # m/s²
+CUTIN_TTC_MIN = 4.0             # s
+CUTIN_A_LEAD_MIN = -0.3         # m/s²; any real lead braking ends the soft recovery
+CUTIN_D_MIN = 3.0               # m
+CUTIN_CLOSING_MAX = 1.5         # m/s; a much slower cut-in is not softened
+CUTIN_V_LEAD_MIN = 5.0          # m/s; crawling / queue cut-ins are never softened
+LM_JERK_FACTOR = 0.3            # MPC jerk factor ceiling while accel matching
+
+
+def cutin_soft_limit(a_target, a_prev, dt):
+  """Gentle cut-in recovery: decreases only at CUTIN_JERK, not below
+  CUTIN_FLOOR (or a_prev if already lower). Increases pass through."""
+  a, ap = float(a_target), float(a_prev)
+  if a >= ap:
+    return a
+  return max(a, max(ap - CUTIN_JERK * float(dt), min(CUTIN_FLOOR, ap)))
+
+
+class MatchedLead:
+  __slots__ = ("present", "status", "dRel", "vLead", "vLeadK", "aLeadK", "aLeadTau", "modelProb", "vRel", "held")
+
+  def __init__(self, lead, tau):
+    self.present = self.status = True
+    for k in ("dRel", "vLead", "vLeadK", "aLeadK", "modelProb", "vRel"):
+      setattr(self, k, _f(getattr(lead, k, float("nan"))))
+    self.aLeadTau = tau
+    self.held = bool(getattr(lead, "held", False))
+
 
 @dataclass(frozen=True)
 class HumanCityConfig:
@@ -175,6 +230,11 @@ class HumanCityConfig:
   set_gap_gate: bool = True      # launch075: roll-stop gap gate on every launch aid
   launch_margin: float = LAUNCH_MARGIN  # launch075: extra planned lead space after a quick launch, m
   stop_anchor: bool = True        # repeated roll-stop: later stops no closer than the first one
+  lead_match: bool = True        # dev-c4-test2: accel / brake matching
+  lm_accel: bool = True
+  lm_brake: bool = False         # sustained-decel prediction: tested, made hard-brake gaps slightly WORSE in sim, off
+  lm_jerk_factor: float = LM_JERK_FACTOR
+  cutin_soft: bool = True        # dev-c4-test2: gentle cut-in recovery
 
 
 DEFAULT_CONFIG = HumanCityConfig()
@@ -340,6 +400,9 @@ class HumanCityOutput:
   launch_jerk: float | None = None   # m/s³ rise-rate override for limit_accel_rise, None = stock
   launch_go: bool = False            # leave Stopping at a_mpc > LAUNCH_GO_A_MIN instead of 0.1
   launch_margin: float = 0.0         # m, extra planned lead space (adds space only)
+  mpc_lead: object = None            # lead to hand the MPC (None = unchanged)
+  accel_match: bool = False
+  cutin_soft: bool = False           # planner applies CUTIN_JERK / CUTIN_FLOOR to decreases
 
 
 class HumanCity:
@@ -352,6 +415,8 @@ class HumanCity:
     self.stop_anchor = None   # m, standstill gap of the last stop in this stop-and-go episode
     self.anchor_moved = False
     self.stop_anchor_first = None
+    self.prev_d = None
+    self.cutin_t = math.inf
     self.out = HumanCityOutput()
 
   def reset(self):
@@ -362,6 +427,8 @@ class HumanCity:
     self.stop_anchor = None
     self.anchor_moved = False
     self.stop_anchor_first = None
+    self.prev_d = None
+    self.cutin_t = math.inf
 
   def update(self, v_ego, lead, personality_name, base_jerk_factor, base_t_follow, cap, desired_gap,
              fcw, dt, plan_a_min=None, set_gap=None) -> HumanCityOutput:
@@ -449,6 +516,45 @@ class HumanCity:
         target = max(target, self.stop_anchor_first + STOP_ANCHOR_AIM)
       target = min(target, sg_a + STOP_ANCHOR_MAX)
       launch_margin = max(launch_margin, max(target - sg_a, 0.0))
+    mpc_lead = None
+    accel_match = False
+    cutin = False
+    if c.lead_match and lead_present(lead):
+      d = _f(getattr(lead, "dRel", float("nan")))
+      vl = _f(getattr(lead, "vLead", float("nan")))
+      al = _f(getattr(lead, "aLeadK", float("nan")))
+      tau = _f(getattr(lead, "aLeadTau", float("nan")))
+      g = _f(desired_gap)
+      if all(math.isfinite(x) for x in (d, vl, al, v)):
+        if al <= LM_BRAKE_A and c.lm_brake:
+          mpc_lead = MatchedLead(lead, min(tau, LM_TAU) if math.isfinite(tau) else LM_TAU)
+        elif (c.lm_accel and al >= LM_A_ON and gap_ok and v >= LM_V_MIN and not fcw and math.isfinite(g) and d >= g
+              and v - vl <= LM_CLOSING_MAX and self.cutin_t > CUTIN_WINDOW):
+          accel_match = True
+          mpc_lead = MatchedLead(lead, min(tau, LM_TAU) if math.isfinite(tau) else LM_TAU)
+          launch_jerk = max(launch_jerk or 0.0, LM_JERK)
+          jf = min(jf, max(c.lm_jerk_factor, 0.0))
+    if c.cutin_soft and lead_present(lead):
+      d = _f(getattr(lead, "dRel", float("nan")))
+      vl = _f(getattr(lead, "vLead", float("nan")))
+      al = _f(getattr(lead, "aLeadK", float("nan")))
+      g = _f(desired_gap)
+      ok = all(math.isfinite(x) for x in (d, vl, al, v, g))
+      if ok and d < g and (self.prev_d is None or self.prev_d - d >= CUTIN_D_JUMP):
+        self.cutin_t = 0.0
+      elif self.cutin_t <= CUTIN_WINDOW:
+        self.cutin_t += dt
+      closing = v - vl if ok else math.inf
+      urgent = (not ok or fcw or u > 0.0 or al < CUTIN_A_LEAD_MIN or d < CUTIN_D_MIN or d >= g
+                or closing > CUTIN_CLOSING_MAX or vl < CUTIN_V_LEAD_MIN
+                or (closing > 0.05 and d / closing < CUTIN_TTC_MIN))
+      if urgent:
+        self.cutin_t = math.inf
+      cutin = self.cutin_t <= CUTIN_WINDOW
+      self.prev_d = d if ok else None
+    else:
+      self.prev_d = None
+      self.cutin_t = math.inf
 
     b_target = wc * boost_weight(lead, c.boost_on_decel)
     if b_target > self.boost:
@@ -468,5 +574,6 @@ class HumanCity:
                                danger_cost=DANGER_ZONE_COST_STOCK * (1.0 + wb * max(c.danger_cost_scale - 1.0, 0.0)),
                                stop_extra_predicted=wc if c.stop_extra_predicted else 0.0, cap=out_cap,
                                launch_jerk=launch_jerk, launch_go=launch_go,
-                               launch_margin=launch_margin)
+                               launch_margin=launch_margin, mpc_lead=mpc_lead, accel_match=accel_match,
+                               cutin_soft=cutin)
     return self.out

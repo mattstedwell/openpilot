@@ -269,7 +269,7 @@ def test_never_closer_than_stock_except_dense_cut_in(sims, p):
   for b in _builds(sims):
     for name, r in sims[(b, p)].items():
       stock = sims[("stock", p)][name]
-      if r["kind"] == "headway":
+      if r["kind"] in ("headway", "leadmatch", "cutin"):   # dense moving gaps by design; lm_* tested below
         continue
       slack = 1.0 if name == "cutin_30mph_10m" else 0.05
       assert r["min_gap_m"] >= stock["min_gap_m"] - slack, (b, p, name, r["min_gap_m"], stock["min_gap_m"])
@@ -306,6 +306,8 @@ def test_city_build_adds_no_accel_and_no_hesitation(sims):
   for p in PERS:
     for name, r in sims[("city", p)].items():
       s = sims[("stock", p)][name]
+      if r["kind"] in ("leadmatch", "cutin"):
+        continue
       if r["kind"] == "headway":
         assert r["peak_accel"] <= 0.15, (p, name)  # gentle close-up to the dense gap
         continue
@@ -537,3 +539,65 @@ def test_repeated_roll_stop_scenarios_catch_stock_ratchet(sims):
   bad = [(p, n) for p in PERS for n, r in sims[("stock", p)].items()
          if r["kind"] == "rollstop" and r["stop_gaps_m"] and min(r["stop_gaps_m"]) < r["stop_gap_m"] - 0.05]
   assert len(bad) >= 10, bad
+# --- dev-c4-test2: lead matching / cut-in recovery ------------------------------------
+def _upd2(hc, v, lead, desired=13.0, fcw=False):
+  return hc.update(v, lead, "standard", 1.0, 1.45, 1.2, desired, fcw, 0.05, plan_a_min=0.0, set_gap=7.52)
+
+
+def test_lead_match_accel_gated():
+  hc = HC.HumanCity()
+  o = _upd2(hc, 10.0, _lead(15.0, 10.5, 1.0))
+  assert o.accel_match and o.mpc_lead.aLeadTau == pytest.approx(HC.LM_TAU)
+  assert o.launch_jerk >= HC.LM_JERK and o.jerk_factor <= HC.LM_JERK_FACTOR + 1e-9
+  assert o.cap == pytest.approx(1.2)                                   # ceiling never raised at speed
+  for v, lead, fcw in ((10.0, _lead(12.0, 10.5, 1.0), False),        # inside desired gap
+                       (10.0, _lead(15.0, 9.0, 1.0), False),         # closing
+                       (10.0, _lead(15.0, 10.5, 0.1), False),        # not accelerating
+                       (10.0, _lead(15.0, 10.5, -1.0), False),       # braking
+                       (10.0, _lead(15.0, 10.5, 1.0), True),         # FCW
+                       (3.0, _lead(15.0, 3.5, 1.0), False)):         # stop-and-go: launch logic owns it
+    o = _upd2(HC.HumanCity(), v, lead, fcw=fcw)
+    assert not o.accel_match, (v, fcw)
+  # brake matching is off (made sim gaps worse): a braking lead goes to the MPC unchanged
+  assert _upd2(HC.HumanCity(), 10.0, _lead(15.0, 10.0, -2.0)).mpc_lead is None
+
+
+def test_cutin_soft_only_for_gentle_cutins():
+  hc = HC.HumanCity()
+  _upd2(hc, 13.0, _lead(30.0, 13.0))
+  o = _upd2(hc, 13.0, _lead(8.0, 12.6))                  # cut-in at 8 m, similar speed
+  assert o.cutin_soft
+  for lead in (_lead(8.0, 12.6, -1.0),                   # cut-in brakes
+               _lead(8.0, 10.0),                         # much slower
+               _lead(2.5, 12.6)):                        # very close
+    hc = HC.HumanCity(); _upd2(hc, 13.0, _lead(30.0, 13.0))
+    assert not _upd2(hc, 13.0, lead).cutin_soft
+  hc = HC.HumanCity(); _upd2(hc, 13.0, _lead(30.0, 13.0))
+  assert not _upd2(hc, 13.0, _lead(8.0, 12.6), fcw=True).cutin_soft
+  hc = HC.HumanCity(); _upd2(hc, 4.0, _lead(30.0, 4.0))
+  assert not _upd2(hc, 4.0, _lead(5.0, 4.0)).cutin_soft   # queue / crawl cut-in: never softened
+
+
+def test_cutin_soft_limit():
+  assert HC.cutin_soft_limit(-3.0, 0.0, 0.05) == pytest.approx(-HC.CUTIN_JERK * 0.05)
+  assert HC.cutin_soft_limit(-3.0, -1.5, 0.05) == pytest.approx(-1.5)
+  assert HC.cutin_soft_limit(-3.0, -2.0, 0.05) == pytest.approx(-2.0)   # never eases existing braking
+  assert HC.cutin_soft_limit(0.5, 0.0, 0.05) == 0.5
+
+
+def test_lead_match_closed_loop(sims):
+  if ("launch", "aggressive") not in sims:
+    pytest.skip("launch_release not in this tree")
+  for p in PERS:
+    R = sims[("launch", p)]
+    for a in (0.5, 1.0, 1.5):
+      r = R[f"lm_accel_{a}"]
+      assert not r["collision"]
+      assert r["peak_accel"] <= HC.human_launch_cap(0.0, p) + 0.05
+    for a in (1, 2, 3):
+      r = R[f"lm_brake_{a}"]
+      assert not r["collision"] and r["brake_delay_s"] is not None and r["brake_delay_s"] <= 0.9
+    for m in (15, 30, 45):
+      for g in (5, 10, 15):
+        r = R[f"lm_cutin_{m}mph_{g}m"]
+        assert not r["collision"] and r["peak_decel"] >= -1.5 and r["peak_jerk"] <= 1.5, (p, m, g)

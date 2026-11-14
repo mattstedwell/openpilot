@@ -174,6 +174,14 @@ SCENARIOS = [
   # long pauses: ego reaches standstill in every cycle
   *[S(f"rs_{d}m_3s", rollstop([d] * 8, pauses=(3.0,)), kind="rollstop") for d in (0.5, 1, 2, 5)],
   S("rs_2m_3s_noisy", rollstop([2] * 8, pauses=(3.0,)), kind="rollstop", noise=True),
+  # --- dev-c4-test2 lead matching (accel / brake tracking, soft cut-in recovery)
+  *[S(f"lm_accel_{a}", [("hold", 8.0), ("acc", a, 40 * MPH), ("hold", 6.0)], ev0=15 * MPH, lv0=15 * MPH,
+      v_cruise=50 * MPH, kind="leadmatch", t_tail=2.0) for a in (0.5, 1.0, 1.5)],
+  *[S(f"lm_brake_{a}", [("hold", 8.0), ("acc", -a, 10 * MPH), ("hold", 8.0)], ev0=35 * MPH, lv0=35 * MPH,
+      v_cruise=45 * MPH, kind="leadmatch", t_tail=2.0) for a in (1, 2, 3)],
+  *[S(f"lm_cutin_{m}mph_{g}m", [("hold", 12.0)], ev0=m * MPH, lv0=m * MPH, v_cruise=(m + 5) * MPH,
+      cut=dict(t=4.0, gap=float(g), v=(m - 1) * MPH), kind="cutin", set_gap_check=False)
+    for m in (15, 30, 45) for g in (5, 10, 15)],
 ]
 
 
@@ -329,7 +337,7 @@ def run(personality, sc, cand):
       vdf.x = max(0.0, vdf.update(ev))
       pac = not standstill
       fcw_prev = mpc.crash_cnt > 2 and not standstill
-      jf = None; tf = None; dcost = None; lj = None; lgo = False; mpc.stop_extra_predicted = 0.0
+      jf = None; tf = None; dcost = None; lj = None; lgo = False; csoft = False; mpc.stop_extra_predicted = 0.0
       mpc.launch_margin = 0.0
       mpc.lead_danger_factor = LM.LEAD_DANGER_FACTOR
       if hold is not None:
@@ -348,6 +356,9 @@ def run(personality, sc, cand):
         if os.environ.get("HCSIM_DEBUG") and k % 5 == 0:
           print(f"DBG t={t:5.2f} d={float(rs.leadOne.dRel):6.2f} vl={float(rs.leadOne.vLead):5.2f} ev={ev:5.2f} "
                 f"lm={mpc.launch_margin:4.2f} ep={hc.launch_ep} w={hc.launch_w:4.2f} anc={getattr(hc, 'stop_anchor', None)}", file=sys.stderr)
+        csoft = bool(getattr(o, "cutin_soft", False))
+        if getattr(o, "mpc_lead", None) is not None:
+          rs = SimpleNamespace(leadOne=o.mpc_lead, leadTwo=rs.leadTwo)
         mpc.stop_extra_predicted = o.stop_extra_predicted
         if o.danger_factor is not None:
           mpc.lead_danger_factor = o.danger_factor
@@ -371,6 +382,8 @@ def run(personality, sc, cand):
         a_t = float(LP.limit_accel_rise(a_t, a_prev, ev, 0.05, jerk=lj))
       except TypeError:  # older trees without the jerk override
         a_t = float(LP.limit_accel_rise(a_t, a_prev, ev, 0.05))
+      if csoft:
+        a_t = float(HC.cutin_soft_limit(a_t, a_prev, 0.05))
       out_a = a_t; plan_a = a_t
       vdf.x = vdf.x + 0.05 * (out_a + a_prev) / 2.0
     CS = SimpleNamespace(vEgo=ev, aEgo=ea, brakePressed=False, standstill=ev < 1e-3,
@@ -426,7 +439,9 @@ def run(personality, sc, cand):
     if sc["kind"] == "headway" and t > 35.0 and ev > 1.0:
       hw_samples.append(gap / ev)
     if k % 20 == 0:
-      trace.append([round(t, 2), round(gap, 2), round(lv / MPH, 2), round(ev / MPH, 2), round(plan_a, 3), round(ea_eff, 3)])
+      t_used = tf if tf is not None else float(LM.get_T_FOLLOW(personality, exp, ev))
+      trace.append([round(t, 2), round(gap, 2), round(lv / MPH, 2), round(ev / MPH, 2), round(plan_a, 3), round(ea_eff, 3),
+                    round(la_true, 3), round(follow_gap(ev, lv, t_used), 2), round(t_used, 3)])
     t += dt_c; k += 1
   return dict(collision=collided, min_gap_m=round(min_gap, 2), stop_gap_m=round(g_stop, 2),
               min_gap_minus_stop_gap_m=round(min_gap - g_stop, 2),

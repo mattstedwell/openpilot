@@ -23,7 +23,7 @@ from openpilot.sunnypilot.selfdrive.car import chill_relaxed
 from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_curve_comfort import CurveComfort
 from types import SimpleNamespace
 from openpilot.sunnypilot.selfdrive.controls.lib.devc4_human_city import HumanCity, LeadHoldover, \
-  LAUNCH_GO_A_MIN, LAUNCH_GO_V_MAX
+  LAUNCH_GO_A_MIN, LAUNCH_GO_V_MAX, cutin_soft_limit
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
   get_jerk_factor, get_T_FOLLOW, get_safe_obstacle_distance, get_stopped_equivalence_factor, LEAD_DANGER_FACTOR,
   STOP_DISTANCE, get_lead_stop_extra)
@@ -178,6 +178,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     jerk_factor, t_follow, danger_cost = None, None, None
     launch_jerk = None
     launch_go = False
+    cutin_soft = False
     self.mpc.stop_extra_predicted = 0.0
     self.mpc.launch_margin = 0.0
     self.mpc.lead_danger_factor = LEAD_DANGER_FACTOR
@@ -202,6 +203,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       launch_jerk = hc.launch_jerk
       launch_go = hc.launch_go
       self.mpc.launch_margin = hc.launch_margin
+      cutin_soft = hc.cutin_soft
+      # dev-c4-test2 lead matching: the MPC sees the lead's accel as
+      # sustained (accel only under the take-up / gap gates; braking always)
+      if hc.mpc_lead is not None:
+        radar_state = SimpleNamespace(leadOne=hc.mpc_lead, leadTwo=radar_state.leadTwo)
       self.mpc.stop_extra_predicted = hc.stop_extra_predicted
       if hc.danger_factor is not None:
         self.mpc.lead_danger_factor = hc.danger_factor
@@ -264,6 +270,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # Less accel / more braking is never delayed.
     if not reset_state:
       self.output_a_target = limit_accel_rise(self.output_a_target, a_prev, v_ego, self.dt, jerk=launch_jerk)
+      if cutin_soft:
+        self.output_a_target = cutin_soft_limit(self.output_a_target, a_prev, self.dt)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 
