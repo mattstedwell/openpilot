@@ -39,6 +39,11 @@ DEFAULT_OVERRIDES = {
   "AutoLaneChangeBsmDelay": True,
   "OnroadScreenOffBrightness": 2,
   "OnroadScreenOffTimer": 3,
+  # Fill-missing only (never migrated): prebuilt libparams_c.so keeps official
+  # compiled defaults, so params_keys.h edits alone do not reach the device.
+  "RoadEdgeLaneChangeEnabled": True,
+  "Blendful": True,
+  "SmartCruiseControlVision": True,
 }
 
 OFFICIAL_SCREEN_BRIGHTNESS = 0  # Auto

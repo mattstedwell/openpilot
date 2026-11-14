@@ -93,7 +93,11 @@ class TestDefaultsIdentity(unittest.TestCase):
     self.assertEqual(set(DEFAULT_OVERRIDES), {
       "AutoLaneChangeTimer", "AutoLaneChangeBsmDelay",
       "OnroadScreenOffBrightness", "OnroadScreenOffTimer",
+      "RoadEdgeLaneChangeEnabled", "Blendful", "SmartCruiseControlVision",
     })
+    self.assertIs(DEFAULT_OVERRIDES["RoadEdgeLaneChangeEnabled"], True)
+    self.assertIs(DEFAULT_OVERRIDES["Blendful"], True)
+    self.assertIs(DEFAULT_OVERRIDES["SmartCruiseControlVision"], True)
     self.assertNotIn("SshEnabled", DEFAULT_OVERRIDES)
     self.assertNotIn("AdbEnabled", DEFAULT_OVERRIDES)
     self.assertNotIn("ChevronInfo", DEFAULT_OVERRIDES)
@@ -429,3 +433,20 @@ class TestMigrationFlagPath(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestFillMissingToggles(unittest.TestCase):
+  class _P:
+    def __init__(self, d): self.d = dict(d)
+    def get(self, k): return self.d.get(k)
+    def put(self, k, v, block=True): self.d[k] = v
+
+  def test_missing_toggles_filled_and_stored_values_kept(self):
+    import tempfile, os
+    from openpilot.sunnypilot.system.devc4_listed_defaults import apply_listed_defaults
+    with tempfile.TemporaryDirectory() as d:
+      p = self._P({"Blendful": False})
+      apply_listed_defaults(p, flag_path=os.path.join(d, "flag"))
+      self.assertIs(p.d["RoadEdgeLaneChangeEnabled"], True)
+      self.assertIs(p.d["SmartCruiseControlVision"], True)
+      self.assertIs(p.d["Blendful"], False)  # user-stored value left alone
