@@ -5,7 +5,8 @@ usage: sp_lite_launch_sim.py TREE_ROOT BUILD_DIR OUT_JSON CAND_JSON [personaliti
 CAND_JSON: {"name": str, "extra": bool, "release": bool, "launch": bool}
   extra   -> long_mpc LEAD_STOP_EXTRA (+10 ft standstill gap); False sets it to 0.0 (stock)
   release -> Toyota brake-hold release (opendbc sunnypilot launch_release)
-  launch  -> lite_launch planner gates (quick start after lead moves)
+  launch  -> lite_launch planner gates
+  holdover-> lite_lead_holdover (phantom lead for <= 1 s radar dropouts) (quick start after lead moves)
 
 Real LongitudinalMpc (host acados build of this tree), the planner's
 MPC + cruise path wired like longitudinal_planner.py, real LongControl, and
@@ -45,6 +46,10 @@ try:
   from opendbc.sunnypilot.car.toyota.launch_release import release_prev_accel
 except Exception:
   release_prev_accel = None
+try:
+  from openpilot.sunnypilot.selfdrive.controls.lib.lite_lead_holdover import LeadHoldover
+except Exception:
+  LeadHoldover = None
 try:
   from openpilot.sunnypilot.selfdrive.controls.lib import lite_launch as LL
 except Exception:
@@ -210,6 +215,7 @@ def run(personality, sc):
                        longitudinalTuning=SimpleNamespace(kiBP=[0.], kiV=[0.]))
   lc = LCmod.LongControl(CP, SimpleNamespace(enableGasInterceptor=False))
   launch = LL.LiteLaunch() if USE_LAUNCH else None
+  hold = LeadHoldover() if (CAND.get("holdover", False) and LeadHoldover is not None) else None
   pid = PIDController(0.0, ([2., 5.], [0.5, 0.25]), k_f=1.0, pos_limit=2.0, neg_limit=-3.5, rate=1 / 0.03)
   aego_f = FirstOrderFilter(0.0, 0.25, 0.03)
   vdf = FirstOrderFilter(ev, 2.0, 0.05)
@@ -285,7 +291,12 @@ def run(personality, sc):
       vdf.x = max(0.0, vdf.update(ev))
       mpc.set_weights(not standstill, personality=personality)
       mpc.set_cur_state(vdf.x, out_a)
-      mpc.update(rs, personality=personality)
+      rs_mpc = rs
+      if hold is not None:
+        held = hold.update(rs.leadOne, ev, 0.05)
+        if held is not rs.leadOne:
+          rs_mpc = SimpleNamespace(leadOne=held, leadTwo=rs.leadTwo)
+      mpc.update(rs_mpc, personality=personality)
       if mpc.solution_status != 0:
         solve_fail += 1
       fcw = mpc.crash_cnt > 2 and not standstill

@@ -242,6 +242,58 @@ class TestE2eStopShift(unittest.TestCase):
     self.assertEqual(ES.shift_e2e_stop(m, None, 5.0, -0.5, False), (-0.5, False))
 
 
+def rlead(d=9.3, v=0.6, a=0.3, present=True):
+  # radarState lead incl. aLeadTau (the holdover needs all four values)
+  return SimpleNamespace(present=present, dRel=d, vLead=v, aLeadK=a, aLeadTau=1.5)
+
+
+class TestLeadHoldover(unittest.TestCase):
+  def setUp(self):
+    from openpilot.sunnypilot.selfdrive.controls.lib import lite_lead_holdover as LH
+    self.LH = LH
+    LH.ENABLED = True
+    self.h = LH.LeadHoldover()
+
+  def test_real_lead_passthrough(self):
+    ld = rlead(d=20.0, v=5.0, a=-1.0)
+    self.assertIs(self.h.update(ld, 6.0, 0.05), ld)
+
+  def test_held_lead_decelerates_never_accelerates_no_fcw(self):
+    self.h.update(rlead(d=15.0, v=6.0, a=-1.5), 6.5, 0.05)
+    prev_v = 6.0
+    for _ in range(20):  # 1.0 s
+      h = self.h.update(rlead(present=False), 6.0, 0.05)
+      self.assertTrue(getattr(h, "held", False))
+      self.assertLessEqual(h.vLead, prev_v)
+      self.assertLessEqual(h.aLeadK, 0.0)
+      self.assertEqual(h.modelProb, 0.0)
+      prev_v = h.vLead
+    self.assertLess(prev_v, 6.0 - 2.9)  # 2x the last -1.5 decel for 1 s
+    self.assertFalse(getattr(self.h.update(rlead(present=False), 6.0, 0.05), "held", False))  # > 1 s: released
+
+  def test_positive_last_accel_held_at_zero(self):
+    self.h.update(rlead(d=15.0, v=6.0, a=1.0), 6.0, 0.05)
+    h = self.h.update(rlead(present=False), 6.0, 0.05)
+    self.assertEqual(h.aLeadK, 0.0)
+    self.assertAlmostEqual(h.vLead, 6.0)
+
+  def test_no_hold_far_or_pulling_away(self):
+    self.h.update(rlead(d=45.0, v=6.0, a=0.0), 6.0, 0.05)
+    self.assertFalse(getattr(self.h.update(rlead(present=False), 6.0, 0.05), "held", False))
+    self.h.update(rlead(d=15.0, v=9.0, a=0.0), 6.0, 0.05)
+    self.assertFalse(getattr(self.h.update(rlead(present=False), 6.0, 0.05), "held", False))
+
+  def test_planner_wiring_mpc_only(self):
+    src = (PKG / "selfdrive/controls/lib/longitudinal_planner.py").read_text()
+    i = src.index("self.lead_holdover.update(radar_state.leadOne")
+    self.assertLess(i, src.index("self.mpc.update(radar_state"))
+    # launch and e2e-stop gates still see the real radar lead
+    self.assertIn("self.lite_launch.update(sm['radarState'].leadOne", src)
+    self.assertIn("shift_e2e_stop(sm['modelV2'], sm['radarState'].leadOne", src)
+    mpc_src = (PKG / "selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py").read_text()
+    self.assertIn("radarstate.leadOne.modelProb > 0.9", mpc_src)  # held modelProb 0.0 -> no FCW
+
+
 class TestSafetyUntouched(unittest.TestCase):
   def test_safety_paths_unchanged_vs_upstream(self):
     try:
@@ -265,7 +317,7 @@ def _acados_ok():
 @unittest.skipUnless(_acados_ok(), "host acados not available")
 class TestClosedLoopMpc(unittest.TestCase):
   """Runs sp_lite_launch_sim.py (real MPC) on the near-miss + roll-stop family, Aggressive."""
-  CASES = "nm_,rollstop_,launch_,stopped_lead_hold,signal_queue_40mph"
+  CASES = "nm_,rollstop_,launch_,stopped_lead_hold,signal_queue_40mph,lead_hard_brake_25mph,lead_hard_brake_40mph_3.5"
 
   @classmethod
   def setUpClass(cls):
@@ -273,7 +325,7 @@ class TestClosedLoopMpc(unittest.TestCase):
     cls.res = {}
     with tempfile.TemporaryDirectory() as d:
       for name, cand in (("stock", {"name": "stock"}),
-                         ("lite", {"name": "lite", "extra": True, "release": True, "launch": True})):
+                         ("lite", {"name": "lite", "extra": True, "release": True, "launch": True, "holdover": True})):
         out = Path(d) / f"{name}.json"
         env = dict(os.environ)
         subprocess.run([sys.executable, str(HERE / "sp_lite_launch_sim.py"), str(TREE), build, str(out),
@@ -284,11 +336,7 @@ class TestClosedLoopMpc(unittest.TestCase):
   def test_lite_no_new_collisions(self):
     for n, r in self.res["lite"].items():
       with self.subTest(n):
-        if n == "nm_lead_lost_while_stopping_15mph":
-          # collides in stock sunnypilot too (radar drops a braking lead for 0.6 s; no holdover)
-          self.assertLessEqual(int(r["collision"]), int(self.res["stock"][n]["collision"]))
-        else:
-          self.assertFalse(r["collision"])
+        self.assertFalse(r["collision"])  # incl. nm_lead_lost_while_stopping_15mph (stock collides)
 
   def test_standstill_gap_plus_10ft(self):
     for n in ("stopped_lead_hold", "signal_queue_40mph"):

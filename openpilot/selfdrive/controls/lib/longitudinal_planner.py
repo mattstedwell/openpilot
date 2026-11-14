@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import numpy as np
+from types import SimpleNamespace
 
 import openpilot.cereal.messaging as messaging
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
@@ -18,6 +19,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 from openpilot.sunnypilot.selfdrive.controls.lib.lite_launch import LiteLaunch
 from openpilot.sunnypilot.selfdrive.controls.lib.lite_e2e_stop import shift_e2e_stop
+from openpilot.sunnypilot.selfdrive.controls.lib.lite_lead_holdover import LeadHoldover
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -42,6 +44,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.dt = dt
     self.accel_boost = AccelBoost()
     self.lite_launch = LiteLaunch()
+    self.lead_holdover = LeadHoldover()
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -88,7 +91,15 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
     else:
       self.mpc.set_cur_state(v_ego, sm['carState'].aEgo)
-    self.mpc.update(sm['radarState'], personality=sm['selfdriveState'].personality)
+    # dev-c4-sunnypilot-lite: keep a decelerating, never-accelerating phantom
+    # lead for <= 1 s if radar drops leadOne (no FCW from it). MPC only.
+    radar_state = sm['radarState']
+    if reset_state:
+      self.lead_holdover.reset()
+    lead_one = self.lead_holdover.update(radar_state.leadOne, v_ego, self.dt)
+    if lead_one is not radar_state.leadOne:
+      radar_state = SimpleNamespace(leadOne=lead_one, leadTwo=radar_state.leadTwo)
+    self.mpc.update(radar_state, personality=sm['selfdriveState'].personality)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
