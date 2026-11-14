@@ -21,6 +21,24 @@ from openpilot.sunnypilot.selfdrive.car.chill_aggressive import is_chill_aggress
 from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_accel_curve import limit_accel_rise, smooth_accel_cap
 from openpilot.sunnypilot.selfdrive.car import chill_relaxed
 from openpilot.sunnypilot.selfdrive.controls.lib.devc4_test3_curve_comfort import CurveComfort
+from types import SimpleNamespace
+from openpilot.sunnypilot.selfdrive.controls.lib.devc4_human_city import HumanCity, LeadHoldover
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
+  get_jerk_factor, get_T_FOLLOW, get_safe_obstacle_distance, get_stopped_equivalence_factor, LEAD_DANGER_FACTOR)
+from openpilot.cereal import log
+
+# dev-c4-human: horizon (first ~2 s) used for the urgency check
+HUMAN_PLAN_N = int(np.searchsorted(T_IDXS_MPC, 2.0)) + 1
+_PERSONALITY_NAME = {log.LongitudinalPersonality.aggressive: "aggressive",
+                     log.LongitudinalPersonality.standard: "standard",
+                     log.LongitudinalPersonality.relaxed: "relaxed"}
+
+
+def desired_follow_gap(v_ego, v_lead, t_follow):
+  """MPC desired distance to the lead at the current state (m)."""
+  if not np.isfinite(v_lead):
+    return float('nan')
+  return float(get_safe_obstacle_distance(v_ego, t_follow) - get_stopped_equivalence_factor(max(v_lead, 0.0)))
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -94,6 +112,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.output_a_target = init_a
     self.output_should_stop = False
     self.curve_comfort = CurveComfort()
+    self.human_city = HumanCity()
+    self.lead_holdover = LeadHoldover()
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
     self.a_desired_trajectory = np.zeros(CONTROL_N)
@@ -146,13 +166,47 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # Get new v_cruise and a_target from Smart Cruise Control and Speed Limit Assist
     v_cruise, self.output_a_target = LongitudinalPlannerSP.update_targets(self, sm, self.v_desired_filter.x, self.output_a_target, v_cruise)
 
+    # dev-c4-human: human-like city following (Chill / always-Chill only).
+    # MPC inputs only: dense-traffic follow time while the lead is calm
+    # (returns to stock T at once when the lead brakes / we close / FCW /
+    # urgent / lead lost), Relaxed-style braking floor (faded out when
+    # urgent), set-gap keeping (danger factor/cost raised, stop extra
+    # planned from the lead's predicted stop). Never raises the plan
+    # above the MPC lead plan; braking never limited. See devc4_human_city.py.
+    jerk_factor, t_follow, danger_cost = None, None, None
+    self.mpc.stop_extra_predicted = 0.0
+    self.mpc.lead_danger_factor = LEAD_DANGER_FACTOR
+    radar_state = sm['radarState']
+    if reset_state:
+      self.human_city.reset()
+      self.lead_holdover.reset()
+    if not exp_mode:
+      lead_one = radar_state.leadOne
+      if self.human_city.config.lead_holdover:
+        lead_one = self.lead_holdover.update(lead_one, v_ego, self.dt)
+        if lead_one is not radar_state.leadOne:
+          radar_state = SimpleNamespace(leadOne=lead_one, leadTwo=radar_state.leadTwo)
+      base_t = get_T_FOLLOW(personality, exp_mode, self.v_desired_filter.x)
+      hc = self.human_city.update(
+        v_ego, lead_one, _PERSONALITY_NAME.get(personality, "standard"), get_jerk_factor(personality, exp_mode),
+        base_t, cap, desired_follow_gap(v_ego, getattr(lead_one, 'vLead', float('nan')), base_t), self.fcw, self.dt,
+        plan_a_min=float(np.min(self.mpc.a_solution[:HUMAN_PLAN_N])))
+      cap = hc.cap
+      jerk_factor, t_follow, danger_cost = hc.jerk_factor, hc.t_follow, hc.danger_cost
+      self.mpc.stop_extra_predicted = hc.stop_extra_predicted
+      if hc.danger_factor is not None:
+        self.mpc.lead_danger_factor = hc.danger_factor
+    else:
+      self.human_city.reset()
+      self.lead_holdover.reset()
+
     self.mpc.set_weights(prev_accel_constraint, personality=personality,
-                         experimental_mode=exp_mode)
+                         experimental_mode=exp_mode, jerk_factor=jerk_factor, danger_cost=danger_cost)
     if self.CP.openpilotLongitudinalControl:
       self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
     else:
       self.mpc.set_cur_state(v_ego, sm['carState'].aEgo)
-    self.mpc.update(sm['radarState'], personality=personality, experimental_mode=exp_mode)
+    self.mpc.update(radar_state, personality=personality, experimental_mode=exp_mode, t_follow=t_follow)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
