@@ -21,6 +21,13 @@ MADSState = custom.ModularAssistiveDrivingSystem.ModularAssistiveDrivingSystemSt
 
 ONROAD_BRIGHTNESS_TIMER_PAUSED = -1
 
+# Calibration still being learned ("Calibration in progress"). invalid is not
+# in progress (it is a fault alert), and calibrated is the normal state.
+CALIBRATING_STATUSES = (
+  log.ExtrinsicsCalibration.Status.uncalibrated,
+  log.ExtrinsicsCalibration.Status.recalibrating,
+)
+
 
 class OnroadTimerStatus(Enum):
   NONE = 0
@@ -67,12 +74,42 @@ class UIStateSP:
     self.torque_override_enabled: bool = False
     self._sp_initialized: bool = False
     self._onroad_timer_saved = None  # remaining countdown while PAUSED
+    # True while onroad and the camera is still calibrating: the onroad
+    # dark-screen / screen-off timer is held so the screen stays on.
+    self.calibration_screen_hold: bool = False
 
   def update(self) -> None:
     if self.sunnylink_enabled:
       self.sunnylink_state.start()
     else:
       self.sunnylink_state.stop()
+
+  @staticmethod
+  def calibration_in_progress(_ui_state) -> bool:
+    """Onroad and extrinsicsCalibration reports uncalibrated or recalibrating."""
+    if not _ui_state.started:
+      return False
+    sm = _ui_state.sm
+    if not sm.seen["extrinsicsCalibration"]:
+      return False
+    try:
+      return sm["extrinsicsCalibration"].calStatus in CALIBRATING_STATUSES
+    except Exception:
+      return False
+
+  def update_calibration_screen_hold(self) -> None:
+    """Keep the onroad screen on while calibrating.
+
+    While calibrating, the OnroadScreenOff countdown is held at its full value
+    every frame (and set_onroad_brightness never dims). When calibration
+    finishes, the countdown restarts from full, so the user's normal
+    dark-screen behavior resumes after the usual delay. No param needed.
+    """
+    holding = self.calibration_in_progress(self)
+    if holding or self.calibration_screen_hold:
+      # also on the frame calibration finishes: restart a full countdown
+      self.reset_onroad_sleep_timer()
+    self.calibration_screen_hold = holding
 
   @staticmethod
   def _alert_is_critical(alert) -> bool:
@@ -140,6 +177,8 @@ class UIStateSP:
 
   @property
   def onroad_brightness_timer_expired(self) -> bool:
+    if getattr(self, "calibration_screen_hold", False):
+      return False
     return self.onroad_brightness != OnroadBrightness.AUTO and self.onroad_brightness_timer == 0
 
   @property
@@ -318,7 +357,8 @@ class DeviceSP:
     if not awake or not _ui_state.started:
       return cur_brightness
 
-    if _ui_state.onroad_brightness_timer != 0:
+    # Calibrating: normal (awake) brightness, never dark / off.
+    if _ui_state.onroad_brightness_timer != 0 or getattr(_ui_state, "calibration_screen_hold", False):
       if _ui_state.onroad_brightness == OnroadBrightness.AUTO_DARK:
         return max(30.0, cur_brightness)
       return cur_brightness
