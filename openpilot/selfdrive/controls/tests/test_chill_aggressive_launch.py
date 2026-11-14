@@ -23,7 +23,8 @@ def test_launch_accel_curve():
   for speed in np.linspace(10., 45., 30):
     assert get_max_accel(speed, True) == pytest.approx(get_max_accel(speed))
   assert get_max_accel(0.) == pytest.approx(1.6)
-  assert get_max_accel(25.) == pytest.approx(0.8)
+  # t312u: Standard == Relaxed at highway speed (25 m/s ~ 56 mph).
+  assert get_max_accel(25.) == pytest.approx(0.64)
   # Below 10 m/s, launch sits above Standard.
   assert get_max_accel(0., True) > get_max_accel(0.)
   assert get_max_accel(5., True) > get_max_accel(5.)

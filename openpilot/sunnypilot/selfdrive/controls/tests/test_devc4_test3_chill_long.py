@@ -101,13 +101,14 @@ def test_accel_caps_match_c3x():
   assert chill_relaxed.MAX_ACCEL_SCALE == pytest.approx(0.8)
   # Official unpatched sunnypilot/dev is still a flat 2.0; we pin below it.
   assert ACCEL_MAX == pytest.approx(2.0)
-  # Standard is the C3X stock curve.
-  for v in (0.0, 10.0, 25.0, 40.0):
+  # Standard is the C3X stock curve below ~40 mph; at >= 45 mph (t312u)
+  # Agg / Std use Relaxed's cap (80% of C3X), blended over 40-45 mph.
+  for v in (0.0, 10.0, 15.0):
     assert get_max_accel(v) == pytest.approx(c3x_stock(v))
   assert get_max_accel(0.0) == pytest.approx(1.6)
   assert get_max_accel(10.0) == pytest.approx(1.2)
-  assert get_max_accel(25.0) == pytest.approx(0.8)
-  assert get_max_accel(40.0) == pytest.approx(0.6)
+  assert get_max_accel(25.0) == pytest.approx(0.64)
+  assert get_max_accel(40.0) == pytest.approx(0.48)
   # Relaxed is 80% of that curve at every speed.
   for v in np.linspace(0.0, 40.0, 21):
     assert get_max_accel(v, chill_relaxed_mode=True) == pytest.approx(c3x_stock(v) * 0.8)
@@ -123,6 +124,8 @@ def test_accel_caps_match_c3x():
   assert get_max_accel(0.0, True) > get_max_accel(0.0)
   for v in (10.0, 25.0, 40.0):
     assert get_max_accel(v, True) == pytest.approx(get_max_accel(v))
+  for v in (20.2, 25.0, 40.0):
+    assert get_max_accel(v) == pytest.approx(get_max_accel(v, chill_relaxed_mode=True))
   # Mutual exclusion: relaxed scale wins if both flags were ever set (C3X).
   assert get_max_accel(0.0, True, True) == pytest.approx(1.28)
 
@@ -135,14 +138,14 @@ def test_open_loop_accel_times():
   assert t_agg == pytest.approx(9.342, abs=0.05)
   assert t_std == pytest.approx(10.149, abs=0.05)
   assert t_rel == pytest.approx(12.686, abs=0.05)
-  # Highway: only Relaxed is slower; Aggressive launch has already tapered off.
+  # Highway (t312u): all three personalities share Relaxed's cap at >= 45 mph.
   t75_rel = time_to(lambda v: get_max_accel(v, chill_relaxed_mode=True), 55, 75)
   t75_std = time_to(lambda v: get_max_accel(v), 55, 75)
   t75_agg = time_to(lambda v: get_max_accel(v, True), 55, 75)
   assert t_agg < t_std < t_rel
   assert t75_agg == pytest.approx(t75_std)
-  assert t75_std == pytest.approx(12.011, abs=0.05)
-  assert t75_agg == pytest.approx(12.011, abs=0.05)
+  assert t75_std == pytest.approx(t75_rel, abs=0.01)
+  assert t75_agg == pytest.approx(t75_rel, abs=0.01)
   assert t75_rel == pytest.approx(15.014, abs=0.05)
 
 

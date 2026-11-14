@@ -40,6 +40,8 @@ def get_cruise_accel(v_cruise, v_ego, a_cruise_prev, dt, cap=None):
 # flat ACCEL_MAX = 2.0; this branch pins Standard to the C3X numbers.
 A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
+HWY_EQUAL_V_START = 40. * CV.MPH_TO_MS  # m/s; Agg/Std start blending to Relaxed's cap
+HWY_EQUAL_V_FULL = 45. * CV.MPH_TO_MS   # m/s; Agg/Std cap == Relaxed's at and above
 
 
 def get_max_accel(v_ego, chill_aggressive_launch=False, chill_relaxed_mode=False):
@@ -53,10 +55,16 @@ def get_max_accel(v_ego, chill_aggressive_launch=False, chill_relaxed_mode=False
   Applied as a cap on get_cruise_accel and on the chosen plan.
   """
   stock = float(np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS))
+  relaxed = stock * chill_relaxed.MAX_ACCEL_SCALE
   if chill_relaxed_mode:
-    return stock * chill_relaxed.MAX_ACCEL_SCALE
+    return relaxed
   extra = ChillAggressiveLaunch.accel_extra(v_ego) if chill_aggressive_launch else 0.0
-  return min(stock + extra, ACCEL_MAX)
+  own = min(stock + extra, ACCEL_MAX)
+  # t312u: at highway speed Aggressive / Standard use Relaxed's cap,
+  # blended linearly over ~40-45 mph (the Agg launch boost is already 0
+  # above 10 m/s). Positive accel only; braking is not capped here.
+  w = float(np.interp(v_ego, [HWY_EQUAL_V_START, HWY_EQUAL_V_FULL], [0.0, 1.0]))
+  return (1.0 - w) * own + w * relaxed
 
 
 def choose_acc_plan(a_mpc, source_mpc, stop_mpc, a_cruise, stop_cruise):

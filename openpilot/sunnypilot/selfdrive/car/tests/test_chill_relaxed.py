@@ -41,7 +41,9 @@ def test_jerk_and_accel():
   assert get_max_accel(25., chill_relaxed_mode=True) == pytest.approx(0.64)
   assert get_max_accel(40., chill_relaxed_mode=True) == pytest.approx(0.48)
   assert get_max_accel(0.) == pytest.approx(1.6)
-  assert get_max_accel(25.) == pytest.approx(0.8)
+  # t312u: at highway speed (>= 45 mph) Standard uses Relaxed's cap.
+  assert get_max_accel(25.) == pytest.approx(0.64)
+  assert get_max_accel(15.) == pytest.approx(1.2 - 0.4 * 5. / 15.)
 
 
 def test_standstill_gaps_unchanged():
