@@ -56,6 +56,15 @@ T_DIFFS = np.diff(T_IDXS, prepend=[0.])
 COMFORT_BRAKE = 2.5
 STOP_DISTANCE = 6.0
 MIN_X_LEAD_FACTOR = 0.5
+# dev-c4-sunnypilot-lite (Matt): stop 10 ft farther back behind every lead,
+# all personalities. Applied at runtime to the lead obstacle (the compiled
+# OCP keeps official STOP_DISTANCE, so the prebuilt solver is unchanged).
+# Full extra wherever the lead is (predicted to be) at or below
+# LEAD_STOP_EXTRA_V_FULL, none at or above LEAD_STOP_EXTRA_V_NONE, so the
+# moving following distance is stock. Set to 0.0 for stock behavior.
+LEAD_STOP_EXTRA = 10 * 0.3048  # m (3.048)
+LEAD_STOP_EXTRA_V_FULL = 0.5   # m/s
+LEAD_STOP_EXTRA_V_NONE = 5.0   # m/s (~11 mph)
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
@@ -80,6 +89,10 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
 
 def get_stopped_equivalence_factor(v_lead):
   return (v_lead**2) / (2 * COMFORT_BRAKE)
+
+def get_lead_stop_extra(v_lead):
+  """Extra standstill gap (m) for a lead at speed v_lead (scalar or array)."""
+  return np.interp(v_lead, [LEAD_STOP_EXTRA_V_FULL, LEAD_STOP_EXTRA_V_NONE], [LEAD_STOP_EXTRA, 0.0])
 
 def get_safe_obstacle_distance(v_ego, t_follow):
   return (v_ego**2) / (2 * COMFORT_BRAKE) + t_follow * v_ego + STOP_DISTANCE
@@ -318,6 +331,12 @@ class LongitudinalMpc:
     # and then treat that as a stopped car/obstacle at this new distance.
     lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
+    # dev-c4-sunnypilot-lite: +10 ft standstill gap behind a present lead,
+    # per prediction step (a lead predicted to stop gets the full extra there).
+    if radarstate.leadOne.present:
+      lead_0_obstacle = lead_0_obstacle - get_lead_stop_extra(lead_xv_0[:,1])
+    if radarstate.leadTwo.present:
+      lead_1_obstacle = lead_1_obstacle - get_lead_stop_extra(lead_xv_1[:,1])
 
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])
     self.source = MPC_SOURCES[np.argmin(x_obstacles[0])]

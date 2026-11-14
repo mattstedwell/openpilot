@@ -16,6 +16,8 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
+from openpilot.sunnypilot.selfdrive.controls.lib.lite_launch import LiteLaunch
+from openpilot.sunnypilot.selfdrive.controls.lib.lite_e2e_stop import shift_e2e_stop
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -39,6 +41,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.fcw = False
     self.dt = dt
     self.accel_boost = AccelBoost()
+    self.lite_launch = LiteLaunch()
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -105,6 +108,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     output_should_stop_mpc = should_stop(v_ego, output_a_target_mpc)
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
+    # dev-c4-sunnypilot-lite: stop ~10 ft before the model's planned stop at
+    # lights / stop signs (skipped when a lead explains the stop; the lead
+    # MPC already adds 10 ft there). Can only lower accel or add shouldStop.
+    output_a_target_e2e, output_should_stop_e2e = shift_e2e_stop(sm['modelV2'], sm['radarState'].leadOne, v_ego,
+                                                                 output_a_target_e2e, output_should_stop_e2e)
 
     self.a_cruise = get_cruise_accel(v_cruise, v_ego, self.a_cruise, self.dt)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
@@ -117,6 +125,16 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
+
+    # dev-c4-sunnypilot-lite: quicker start once the lead clearly pulls away.
+    # Gates re-checked every cycle, nothing latched; see lite_launch.py.
+    if reset_state:
+      self.lite_launch.reset()
+    quick_start, output_a_target = self.lite_launch.update(sm['radarState'].leadOne, v_ego, sm['carState'].standstill,
+                                                           self.fcw, output_a_target, output_a_target_e2e,
+                                                           output_should_stop_e2e)
+    if quick_start:
+      self.output_should_stop = False
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
