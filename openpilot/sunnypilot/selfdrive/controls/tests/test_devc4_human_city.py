@@ -175,25 +175,36 @@ def test_human_launch_cap_gated():
 # --- launchboost (Matt t372u: stronger launch when the lead pulls away) -------------
 
 def test_launchboost_caps_within_limits_and_ordered():
-  assert [HC.human_launch_cap(0.0, p) for p in PERS] == pytest.approx([2.0, 1.8, 1.6])
-  assert [HC.human_launch_cap(15 * MPH, p) for p in PERS] == pytest.approx([1.85, 1.65, 1.45])
-  for mph in range(0, 60, 2):
-    caps = [HC.human_launch_cap(mph * MPH, p) for p in PERS]
-    assert all(0.0 <= c <= 2.0 for c in caps), (mph, caps)   # openpilot / Toyota / panda ACCEL_MAX
-    assert caps[0] >= caps[1] >= caps[2], (mph, caps)
-  assert HC.HumanCityConfig().launch_cap_dv == pytest.approx(3.0)
+  # v2 (Matt t374u): full boost 0-10 mph, smooth taper onto the normal limit by 22 mph
+  base = {"aggressive": 1.3, "standard": 1.1, "relaxed": 0.9}
+  for mph in (0, 5, 10):
+    assert [HC.human_launch_cap(mph * MPH, p, base[p]) for p in PERS] == pytest.approx([2.0, 1.8, 1.6])
+  for mph in (22, 25, 30, 45):
+    assert [HC.human_launch_cap(mph * MPH, p, base[p]) for p in PERS] == pytest.approx([base[p] for p in PERS])
+  for p in PERS:
+    vs = [i * 0.01 for i in range(0, 1500)]
+    caps = [HC.human_launch_cap(v, p, base[p]) for v in vs]
+    assert all(0.0 <= c <= 2.0 for c in caps)                     # openpilot / Toyota / panda ACCEL_MAX
+    assert all(b <= a + 1e-12 for a, b in zip(caps, caps[1:]))    # never rises with speed
+    steps = [abs(b - a) / 0.01 for a, b in zip(caps, caps[1:])]
+    assert max(steps) < 0.4                                       # no step: |d ceiling / dv| < 0.4 1/s
+    # zero slope where the taper starts and ends (C2 smootherstep)
+    for v_edge in (HC.LAUNCH_FULL_V, HC.LAUNCH_TAPER_END_V):
+      assert abs(HC.human_launch_cap(v_edge + 0.05, p, base[p]) - HC.human_launch_cap(v_edge - 0.05, p, base[p])) < 1e-3
+  assert HC.human_launch_cap(5.0, "standard", 2.5) == pytest.approx(2.5)  # never below the normal limit
+  assert HC.HumanCityConfig().launch_cap_dv == pytest.approx(3.5)
 
 
 def test_launchboost_extra_fades_as_ego_matches_lead_speed():
   base = 1.25
   full = HC.human_launch_cap(4.0, "standard")
   caps = []
-  for v_lead in (4.0, 5.0, 5.5, 7.0, 9.0):
+  for v_lead in (4.0, 5.0, 5.5, 7.5, 9.0):
     hc = HC.HumanCity()
     o = hc.update(4.0, lead(d=30.0, v=v_lead, a=1.0), "standard", 1.0, 1.45, base, 10.0, False, DT, plan_a_min=0.0)
     caps.append(o.cap)
   assert caps[0] == pytest.approx(base)                       # at the lead's speed: personality cap only
-  assert caps[1] == pytest.approx(base + (full - base) / 3.0)
+  assert caps[1] == pytest.approx(base + (full - base) / 3.5)
   assert caps[3] == pytest.approx(full) and caps[4] == pytest.approx(full)
   assert caps == sorted(caps)
   # fade off -> full ceiling whenever the gate holds
@@ -215,6 +226,7 @@ def test_launchboost_extra_fades_as_ego_matches_lead_speed():
 # launch075 / 96a69d96a8 sim values (host, before launchboost): time from the lead
 # moving to ego reaching 20 mph, lead accelerating at 2.0 m/s² from the set gap.
 L075_T20_LEAD2 = {"aggressive": 6.90, "standard": 7.62, "relaxed": 8.59}
+L075_T10_LEAD2 = {"aggressive": 3.95, "standard": 4.23, "relaxed": 4.62}
 
 
 def test_launchboost_closed_loop_faster_pullaway(sims):
@@ -230,6 +242,7 @@ def test_launchboost_closed_loop_faster_pullaway(sims):
       assert 0.55 <= r["t_move_mean"] <= 0.85, (p, a, r["t_move"])   # reaction kept ~0.75 s
     r = sims[("launch", p)]["lp_lead_2.0"]
     assert r["t_20mph"] <= L075_T20_LEAD2[p] - 0.4, (p, r["t_20mph"])
+    assert r["t_10mph"] <= L075_T10_LEAD2[p] - 0.15, (p, r["t_10mph"])
     assert r["peak_accel"] >= HC.human_launch_cap(0.0, p) - 0.3, (p, r["peak_accel"])
 
 

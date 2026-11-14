@@ -295,7 +295,7 @@ def run(personality, sc, cand):
   hw_samples = []; dense_max = 0.0; trace = []
   first_brake_t = None; lead_brake_t = None
   t_end_lead = None
-  t_v10 = t_v20 = None; diag = []
+  t_v5 = t_v10 = t_v20 = None; diag = []
   t_max = 240.0
   while t < t_max:
     lv = lead.step(t, dt_c)
@@ -429,6 +429,8 @@ def run(personality, sc, cand):
     if gap <= 0.0: collided = True
     v_peak = max(v_peak, ev)
     if lead.started is not None:
+      if t_v5 is None and ev >= 5 * MPH:
+        t_v5 = round(t - lead.started, 2)
       if t_v10 is None and ev >= 10 * MPH:
         t_v10 = round(t - lead.started, 2)
       if t_v20 is None and ev >= 20 * MPH:
@@ -459,7 +461,7 @@ def run(personality, sc, cand):
               brake_delay_s=None if (first_brake_t is None or lead_brake_t is None) else round(first_brake_t - lead_brake_t, 2),
               v_ego_peak_mph=round(v_peak / MPH, 2), dense_max_s=round(dense_max, 3),
               duration_s=round(t, 1), solve_fail=solve_fail, kind=sc["kind"], set_gap_check=sc["set_gap_check"],
-              t_10mph=t_v10, t_20mph=t_v20, diag=diag, trace=trace)
+              t_5mph=t_v5, t_10mph=t_v10, t_20mph=t_v20, diag=diag, trace=trace)
 
 
 pers = [P.aggressive, P.standard, P.relaxed]
@@ -479,5 +481,5 @@ for p in pers:
           f"min={r['min_gap_m']:6.2f}(set {r['stop_gap_m']}) sgap={r['standstill_gap_minus_stop_gap_m']} "
           f"hw={r['headway_s']} a+={r['peak_accel']:.2f} a-={r['peak_decel']:.2f} jpk={r['peak_jerk']:.2f} "
           f"jrms={r['rms_jerk']:.3f} tmove={r['t_move_mean']} bd={r['brake_delay_s']} fail={r['solve_fail']} "
-          f"dense={r['dense_max_s']} t10={r['t_10mph']} t20={r['t_20mph']}", flush=True)
+          f"dense={r['dense_max_s']} t5={r['t_5mph']} t10={r['t_10mph']} t20={r['t_20mph']}", flush=True)
 OUT.write_text(json.dumps(res, indent=1))

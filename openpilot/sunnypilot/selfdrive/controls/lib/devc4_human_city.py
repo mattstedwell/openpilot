@@ -113,14 +113,20 @@ HOLD_DECEL_MAX = -4.0           # m/s² ... capped here
 # openpilot / Toyota / panda 2.0 m/s² limit) and held further up the speed
 # range. Still only a ceiling: the MPC lead plan bounds it, braking passes
 # straight through, and it applies only under the take-up gate below.
-HUMAN_CAP_BP = (0.0, 15.0 * MPH, 30.0 * MPH, 45.0 * MPH)
-HUMAN_CAP = {"aggressive": (2.00, 1.85, 1.30, 0.0), "standard": (1.80, 1.65, 1.15, 0.0),
-             "relaxed": (1.60, 1.45, 1.00, 0.0)}
+# launchboost v2 (Matt t374u: "It can slowly cut out earlier instead of
+# waiting until 30mph. The first 10mph are more important then transition"):
+# the full ceiling holds from 0 to LAUNCH_FULL_V, then blends onto the
+# normal personality limit (the planner's cap) with a C2 smootherstep that
+# ends at LAUNCH_TAPER_END_V. Zero slope at both ends, so there is no step in
+# the ceiling or its rate (no jerk kick at the start or end of the taper).
+HUMAN_CAP_FULL = {"aggressive": 2.00, "standard": 1.80, "relaxed": 1.60}
+LAUNCH_FULL_V = 10.0 * MPH       # m/s; full boost up to here
+LAUNCH_TAPER_END_V = 22.0 * MPH  # m/s; normal personality limit from here
 # The extra over the personality cap fades out as ego speed comes within
 # LAUNCH_CAP_DV of the lead's speed (a driver eases off as the gap stops
 # opening), so the stronger launch does not overshoot into a lead that holds
 # its speed or brakes right after pulling away (accordion traffic).
-LAUNCH_CAP_DV = 3.0             # m/s
+LAUNCH_CAP_DV = 3.5             # m/s (3.0 on dc63c56213; 3.5 keeps every stop gap at dc63c56213 with the v2 shape)
 TAKEUP_A_LEAD_MIN = -0.05
 TAKEUP_V_LEAD_MIN = 0.15
 TAKEUP_GAP_MARGIN = 0.05
@@ -281,9 +287,25 @@ def takeup_ok(v_ego, lead, desired_gap, fcw) -> bool:
   return vl >= TAKEUP_V_LEAD_MIN and al >= TAKEUP_A_LEAD_MIN and vl > v and d >= g + TAKEUP_GAP_MARGIN
 
 
-def human_launch_cap(v_ego, personality_name: str) -> float:
-  vals = HUMAN_CAP.get(personality_name, HUMAN_CAP["standard"])
-  return max(0.0, _interp(max(_f(v_ego), 0.0) if math.isfinite(_f(v_ego)) else 0.0, HUMAN_CAP_BP, vals))
+def _smootherstep01(x):
+  x = min(max(x, 0.0), 1.0)
+  return x * x * x * (x * (6.0 * x - 15.0) + 10.0)
+
+
+def launch_boost_weight(v_ego) -> float:
+  """1 up to LAUNCH_FULL_V, C2 smootherstep down to 0 at LAUNCH_TAPER_END_V."""
+  v = _f(v_ego)
+  if not math.isfinite(v):
+    return 0.0
+  return 1.0 - _smootherstep01((v - LAUNCH_FULL_V) / (LAUNCH_TAPER_END_V - LAUNCH_FULL_V))
+
+
+def human_launch_cap(v_ego, personality_name: str, base_cap: float = 0.0) -> float:
+  """Take-up ceiling: the full boost blended onto base_cap (the normal
+  personality limit) by speed. Never below base_cap."""
+  full = HUMAN_CAP_FULL.get(personality_name, HUMAN_CAP_FULL["standard"])
+  base = max(_f(base_cap), 0.0) if math.isfinite(_f(base_cap)) else 0.0
+  return base + launch_boost_weight(v_ego) * max(full - base, 0.0)
 
 
 def boost_weight(lead, on_decel=True) -> float:
@@ -418,7 +440,7 @@ class HumanCity:
       sg = _f(set_gap)
       gap_ok = math.isfinite(d) and math.isfinite(sg) and d >= sg - SET_GAP_TOL
     if c.human_launch and gap_ok and takeup_ok(v, lead, desired_gap, fcw) and u <= 0.0:
-      hcap = human_launch_cap(v, personality_name)
+      hcap = human_launch_cap(v, personality_name, out_cap)
       if c.launch_cap_dv > 0.0 and hcap > out_cap:
         # ease off the extra take-up accel as we match the lead's speed (a
         # driver stops pressing once the gap stops opening): no overshoot
