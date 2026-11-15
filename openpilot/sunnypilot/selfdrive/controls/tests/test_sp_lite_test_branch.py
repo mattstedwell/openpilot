@@ -52,10 +52,20 @@ class TestFusion(unittest.TestCase):
     self.assertFalse(LF.lead_moving_agreed(lead(radar=False), mlead(v=3.0)))
     self.assertFalse(LF.lead_moving_agreed(SimpleNamespace(present=True, dRel=9, vLead=1, aLeadK=1), None))  # no flag
 
-  def test_vision_must_agree_moving(self):
-    self.assertFalse(LF.lead_moving_agreed(lead(), mlead(v=0.0)))
+  def test_radar_only_launch_decision(self):
+    # sunnypilot-lite-test2 (Matt): vision removed from the launch decision; radar lead moving = go
+    self.assertFalse(LF.REQUIRE_MODEL_AGREE)
+    self.assertTrue(LF.REQUIRE_RADAR)
+    self.assertTrue(LF.lead_moving_agreed(lead(), mlead(v=0.0)))  # the model disagreeing no longer blocks
     self.assertTrue(LF.lead_moving_agreed(lead(), mlead(v=0.3)))
     self.assertFalse(LF.lead_moving_agreed(lead(present=False), mlead(v=0.3)))
+
+  def test_model_stop_blocks(self):
+    self.assertFalse(LF.model_stop_blocks(None, 9.0, 3.0))       # no planned stop
+    self.assertFalse(LF.model_stop_blocks(6.0, 9.0, 3.0))        # stop behind the lead: explained
+    self.assertFalse(LF.model_stop_blocks(2.0, 12.0, 0.5))       # lead has not moved far yet
+    self.assertTrue(LF.model_stop_blocks(2.0, 12.0, 1.5))        # line the lead left behind
+    self.assertTrue(LF.model_stop_blocks(float('nan'), 12.0, 1.5))  # bad data: block (conservative)
 
   def test_conservative_gap(self):
     self.assertFalse(LF.USE_MODEL_GAP)  # shipped off (sim regression)
@@ -106,8 +116,8 @@ class TestLaunchFusionGate(unittest.TestCase):
   def test_radar_alone_launches(self):
     self.assertTrue(self._go(lead(d=9.5, v=0.6, a=0.5), None)[0])
 
-  def test_vision_disagrees_blocks(self):
-    self.assertFalse(self._go(lead(d=9.5, v=0.6, a=0.5), mlead(v=0.0))[0])
+  def test_vision_disagreeing_no_longer_blocks(self):
+    self.assertTrue(self._go(lead(d=9.5, v=0.6, a=0.5), mlead(v=0.0))[0])
 
   def test_vision_only_blocks(self):
     self.assertFalse(self._go(lead(d=9.5, v=0.6, a=0.5, radar=False), mlead(v=0.6))[0])
@@ -123,7 +133,8 @@ class TestLaunchFusionGate(unittest.TestCase):
   def test_planner_passes_model_lead(self):
     src = (PKG / "selfdrive/controls/lib/longitudinal_planner.py").read_text()
     self.assertIn("model_lead = model_leads[0]", src)
-    self.assertIn("output_should_stop_e2e, model_lead=model_lead)", src)
+    self.assertIn("output_should_stop_e2e, model_lead=model_lead,", src)
+    self.assertIn("model_stop_x=model_stop_x, a_plan_radar=a_plan_radar", src)
 
 
 class TestSmoothStopLongcontrol(unittest.TestCase):
@@ -278,10 +289,13 @@ class TestE2eStopMemory(unittest.TestCase):
 
 
 class TestBoost(unittest.TestCase):
-  def test_shipped_off(self):
-    self.assertFalse(LB.ENABLED)  # backed off: regressed hard-brake-after-launch gaps in sim
+  def test_shipped_on(self):
+    self.assertTrue(LB.ENABLED)  # sunnypilot-lite-test2: re-enabled for a stronger 0-10 mph launch
 
   def test_disabled_is_passthrough(self):
+    old = LB.ENABLED
+    LB.ENABLED = False
+    self.addCleanup(setattr, LB, "ENABLED", old)
     b = LB.LiteLaunchBoost()
     b.update(lead(d=9.05, v=0.0, a=0.0), 0.0, True, False, P.standard, 0.0, 0.0, 0.05)
     self.assertEqual(b.update(lead(d=14.0, v=3.0, a=1.5), 1.0, False, False, P.standard, 0.5, 0.5, 0.05), (False, 0.5))
@@ -312,17 +326,22 @@ class TestBoost(unittest.TestCase):
       self.assertFalse(on); self.assertEqual(a, 0.5)
       on, _ = b.update(lead(d=14.0, v=3.0, a=1.5), 1.0, False, False, P.standard, 0.5, 0.5, 0.05)
       self.assertFalse(on)
-      # vision-only lead / model says stopped / fcw / model stop: nothing
-      for kw in (dict(ld=lead(d=14.0, v=3.0, a=1.5, radar=False), ml=None, fcw=False, ss=False),
-                 dict(ld=lead(d=14.0, v=3.0, a=1.5), ml=mlead(x=15.5, v=0.0), fcw=False, ss=False),
-                 dict(ld=lead(d=14.0, v=3.0, a=1.5), ml=None, fcw=True, ss=False),
-                 dict(ld=lead(d=14.0, v=3.0, a=1.5), ml=None, fcw=False, ss=True)):
+      # vision-only lead / fcw / a model stop the lead does not explain (line): nothing
+      for kw in (dict(ld=lead(d=14.0, v=3.0, a=1.5, radar=False), fcw=False, sx=None),
+                 dict(ld=lead(d=14.0, v=3.0, a=1.5), fcw=True, sx=None),
+                 dict(ld=lead(d=14.0, v=3.0, a=1.5), fcw=False, sx=2.0)):
         b = LB.LiteLaunchBoost()
         b.update(lead(d=9.05, v=0.0, a=0.0), 0.0, True, False, P.standard, 0.0, 0.0, 0.05)
-        on, a = b.update(kw["ld"], 1.0, False, kw["fcw"], P.standard, 0.5, 0.5, 0.05, 2.0, kw["ss"], model_lead=kw["ml"])
+        on, a = b.update(kw["ld"], 1.0, False, kw["fcw"], P.standard, 0.5, 0.5, 0.05, 2.0, False, model_stop_x=kw["sx"])
         self.assertFalse(on); self.assertEqual(a, 0.5)
+      # radar-only: the model's own lead saying "stopped" or its shouldStop no longer block
+      b = LB.LiteLaunchBoost()
+      b.update(lead(d=9.05, v=0.0, a=0.0), 0.0, True, False, P.standard, 0.0, 0.0, 0.05)
+      on, _ = b.update(lead(d=14.0, v=3.0, a=1.5), 1.0, False, False, P.standard, 0.5, 0.5, 0.05, 0.0, True,
+                       model_lead=mlead(x=15.5, v=0.0))
+      self.assertTrue(on)
     finally:
-      LB.ENABLED = False
+      LB.ENABLED = True
 
   def test_fuzz_never_lowers_never_exceeds(self):
     LB.ENABLED = True
@@ -342,7 +361,7 @@ class TestBoost(unittest.TestCase):
         self.assertLessEqual(a, max(a_t, 2.0))
         self.assertTrue(math.isfinite(a))
     finally:
-      LB.ENABLED = False
+      LB.ENABLED = True
 
 
 if __name__ == "__main__":

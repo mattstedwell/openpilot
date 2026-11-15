@@ -86,6 +86,21 @@ if LB is not None:
   for _k, _v in CAND.get("lb", {}).items():  # exploratory overrides only
     setattr(LB, _k, _v)
 try:
+  from openpilot.sunnypilot.selfdrive.controls.lib import lite_lead_lock as LK
+except Exception:
+  LK = None
+USE_LOCK = bool(CAND.get("lock", False))
+try:
+  from openpilot.sunnypilot.selfdrive.controls.lib import lite_turn_cap as TC
+except Exception:
+  TC = None
+if TC is not None:
+  TC.ENABLED = bool(CAND.get("turncap", False))
+if LK is not None:
+  LK.ENABLED = USE_LOCK
+  for _k, _v in CAND.get("lk", {}).items():
+    setattr(LK, _k, _v)
+try:
   from openpilot.sunnypilot.selfdrive.controls.lib import lite_e2e_stop as ES
 except Exception:
   ES = None
@@ -96,7 +111,9 @@ if ES is not None:
 # shouldStop + a plan for lite_e2e_stop) in the planner min, like the real
 # planner. Scenarios without a "model" spec get a free-road model (non-limiting).
 USE_E2E = bool(CAND.get("e2e", False))
+BOOST_CLEARS_SS = bool(CAND.get("boost_clears_ss", False))  # planner of the fix branch clears shouldStop when boosting
 MODEL_SMOOTH = float(CAND.get("model_smooth", 0.3))  # stock modeld LONG_SMOOTH_SECONDS
+MODEL_LAG = float(CAND.get("model_lag", 0.4))  # s: how late the emulated model sees the lead move ("lead" spec)
 if CAND.get("rel_hold") is not None:
   import opendbc.sunnypilot.car.toyota.launch_release as _LR
   _LR.LAUNCH_RELEASE_HOLD = float(CAND["rel_hold"])
@@ -128,7 +145,7 @@ def S(name, segs, ev0=0.0, lv0=0.0, gap0=None, v_cruise=45 * MPH, cut=None, t_ta
   return dict(name=name, segs=segs, ev0=ev0, lv0=lv0, gap0=gap0, v_cruise=v_cruise, cut=cut, t_tail=t_tail,
               noise=noise, lost=lost or [], appear=appear, kind=kind, headway_mph=headway_mph,
               set_gap_check=set_gap_check, model=model, still=still, t_ref=t_ref, flicker=flicker,
-              vision=vision, gone_after=None)
+              vision=vision, gone_after=None, steer=None)
 
 
 def accordion(peaks, ups, dns, wait=4.0, hold=2.0):
@@ -272,6 +289,55 @@ SCENARIOS += [
     kind="fusion"),
 ]
 SCENARIOS += MODEL_SCENARIOS
+# realistic lead launches (sunnypilot-lite-test-fix, Matt's road report: car did not move / weak launch):
+# the emulated driving model plans to stop m_gap behind the lead and only pulls away once it SEES the lead
+# moving (MODEL_LAG late), like the real e2e candidate. Needs CAND e2e; t_ref is the lead start.
+RL_SCENARIOS = []
+for _mg in (3.0, 4.5, 6.0):
+  for _a in (1.0, 1.5, 2.5):
+    RL_SCENARIOS.append(S(f"rl_stop_launch_g{_mg}_a{_a}", [("hold", 12.0), ("acc", _a, 30 * MPH), ("hold", 8.0)],
+                          ev0=25 * MPH, lv0=0.0, gap0=60.0, model=[(0.0, "lead", (_mg, 1.5))], kind="rl_launch", t_ref=12.0))
+# radar lead flickers / is vision-only at standstill and during the departure
+RL_SCENARIOS += [
+  S("rl_flicker_launch", [("hold", 12.0), ("acc", 1.5, 30 * MPH), ("hold", 8.0)], ev0=25 * MPH, gap0=60.0,
+    model=[(0.0, "lead", (4.5, 1.5))], flicker=(9.0, 14.0, 0.3, 0.2), kind="rl_launch", t_ref=12.0),
+  S("rl_radar_absent_launch", [("hold", 12.0), ("acc", 1.5, 30 * MPH), ("hold", 8.0)], ev0=25 * MPH, gap0=60.0,
+    model=[(0.0, "lead", (4.5, 1.5))], lost=[(10.0, 13.5)], vision=("fallback", 0.0, 1e9), kind="rl_launch", t_ref=12.0),
+  S("rl_vision_only_launch", [("hold", 12.0), ("acc", 1.5, 30 * MPH), ("hold", 8.0)], ev0=25 * MPH, gap0=60.0,
+    model=[(0.0, "lead", (4.5, 1.5))], vision=("only", 9.0, 1e9), kind="rl_launch", t_ref=12.0),
+  # lead pulls away then stops again after a short roll: must not inch closer
+  S("rl_roll_stop_x6", [("hold", 12.0)] + sum([[("dist", 1.0, -2.0, 2.0), ("hold", 1.5)] for _ in range(6)], []),
+    ev0=25 * MPH, gap0=60.0, model=[(0.0, "lead", (4.5, 1.5))], kind="rollstop"),
+  # lead goes, then brakes hard after the launch
+  S("rl_go_then_brake", [("hold", 12.0), ("acc", 2.0, 12 * MPH), ("acc", -4.0, 0.0), ("hold", 6.0)], ev0=25 * MPH,
+    gap0=60.0, model=[(0.0, "lead", (4.5, 1.5))], kind="adversarial"),
+]
+SCENARIOS += RL_SCENARIOS
+# stop-and-go lead lock (Matt, Nov 14): all after a real approach to a stopped lead, realistic model
+_LL = dict(ev0=25 * MPH, gap0=60.0, model=[(0.0, "lead", (4.5, 1.5))], t_ref=12.0)
+LL_SCENARIOS = [
+  S("ll_hard_launch", [("hold", 12.0), ("acc", 3.0, 25 * MPH), ("hold", 6.0)], kind="lock", **_LL),
+  S("ll_slow_launch", [("hold", 12.0), ("acc", 0.5, 15 * MPH), ("hold", 6.0)], kind="lock", **_LL),
+  S("ll_creep_stop_x8", [("hold", 12.0)] + sum([[("dist", 0.6, -1.0, 0.7), ("hold", 1.0)] for _ in range(8)], []),
+    kind="rollstop", **_LL),
+  S("ll_go_brake_3mph", [("hold", 12.0), ("acc", 2.0, 3 * MPH), ("acc", -4.0, 0.0), ("hold", 6.0)], kind="lock", **_LL),
+  S("ll_radar_dropout", [("hold", 12.0), ("acc", 1.5, 20 * MPH), ("hold", 6.0)], lost=[(12.6, 13.4)], kind="lock", **_LL),
+  S("ll_cutin", [("hold", 12.0), ("acc", 1.0, 10 * MPH), ("hold", 8.0)], cut=dict(t=13.5, gap=4.0, v=0.5),
+    set_gap_check=False, kind="lock", **_LL),
+  S("ll_rollback", [("hold", 12.0), ("back", 0.3, 1.0), ("hold", 4.0), ("acc", 1.5, 15 * MPH), ("hold", 6.0)],
+    still=(12.0, 17.0), kind="lock", **{k: v for k, v in _LL.items() if k != "t_ref"}),
+  S("ll_noisy_stopped_hold", [("hold", 25.0)], noise=True, still=(10.0, 25.0), kind="lock",
+    **{k: v for k, v in _LL.items() if k != "t_ref"}),
+]
+SCENARIOS += LL_SCENARIOS
+# low-speed 90 deg right turn (Matt): following a lead at 12 mph, set speed 35 mph, wheel -300 deg for 6 s;
+# the lead turns out of view mid-turn (radar lost, physically gone): the car must not accelerate hard in the corner
+for _v in (10, 12, 15):
+  _sc = S(f"turn_right_lead_lost_{_v}mph", [("hold", 30.0)], ev0=_v * MPH, lv0=_v * MPH, v_cruise=35 * MPH,
+          lost=[(5.5, 1e9)], kind="turn", set_gap_check=False, t_tail=0.0)
+  _sc["steer"] = [(4.0, 9.0, -300.0)]
+  _sc["gone_after"] = 5.5
+  SCENARIOS.append(_sc)
 
 
 class Lead:
@@ -290,6 +356,11 @@ class Lead:
         _, acc, vt = seg
         if (acc > 0 and self.v < vt - 1e-6) or (acc < 0 and self.v > vt + 1e-6):
           a = acc; break
+      elif seg[0] == "back":  # ("back", speed, duration): lead rolls backward (negative speed)
+        if self.t_seg < seg[2]:
+          self.a = 0.0; self.v = -abs(seg[1]); self.t_seg += dt
+          return self.v
+        self.v = 0.0
       elif seg[0] == "dist":
         _, au, ad, D = seg
         vp = math.sqrt(2 * D / (1 / au + 1 / abs(ad)))
@@ -327,11 +398,21 @@ class ModelEmu:
     x = np.concatenate([[0.0], np.cumsum(np.diff(self.T) * (v[1:] + v[:-1]) / 2.0)])
     return x, v
 
-  def update(self, t, ex, ev):
+  def update(self, t, ex, ev, lead_obs=None):
     st, arg = "free", None
     for te, s_, a_ in self.spec:
       if t >= te - 1e-9:
         st, arg = s_, a_
+    if st == "lead":
+      # behind a lead: the model plans to stop model_gap behind the (lagged) lead
+      # while it still sees the lead stopped, and pulls away (ramp to a_go) once it
+      # sees it moving. lead_obs = (gap, v_lead, physical) as perceived (lagged).
+      m_gap, a_go = arg
+      g, lvo, phys = lead_obs if lead_obs is not None else (1e3, 30.0, False)
+      if phys and lvo < 0.3:
+        st, arg = "stop", ex + max(g - m_gap, 0.0)
+      else:
+        st, arg = "go", a_go
     if st == "go" and self.st != "go":
       self.t_go = t
     self.st = st
@@ -365,11 +446,27 @@ def LINE_OF(sc):
   return None
 
 
-def _call_launch(launch, *args, model_lead=None):
+def _call_launch(launch, *args, model_lead=None, **kw):
   try:
-    return launch.update(*args, model_lead=model_lead)
+    return launch.update(*args, model_lead=model_lead, **kw)
   except TypeError:
-    return launch.update(*args)
+    try:
+      return launch.update(*args, model_lead=model_lead)
+    except TypeError:
+      return launch.update(*args)
+
+
+def steer_at(sc, t):
+  """(wheel angle deg, rate deg/s) for sc["steer"] = [(t0, t1, angle)], 1.5 s ramps in/out."""
+  for t0_, t1_, a_ in sc.get("steer") or []:
+    if t0_ <= t < t1_:
+      r = 1.5
+      if t < t0_ + r:
+        return a_ * (t - t0_) / r, a_ / r
+      if t > t1_ - r:
+        return a_ * (t1_ - t) / r, -a_ / r
+      return a_, 0.0
+  return 0.0, 0.0
 
 
 def run(personality, sc):
@@ -386,6 +483,8 @@ def run(personality, sc):
   lc = LCmod.LongControl(CP, SimpleNamespace(enableGasInterceptor=False))
   launch = LL.LiteLaunch() if USE_LAUNCH else None
   boost = LB.LiteLaunchBoost() if USE_BOOST else None
+  lock = LK.LeadLock() if (USE_LOCK and LK is not None) else None
+  lock_on = 0; ego_a_onset = None; a_at = {}; gap_at = {}; turn_peak_a = 0.0; turn_peak_ea = 0.0; turn_g = {}
   model = ModelEmu(sc["model"], sc["v_cruise"]) if USE_E2E else None
   use_fusion = bool(CAND.get("fusion", True))
   vis_hist = []
@@ -478,6 +577,7 @@ def run(personality, sc):
         rs = HM.radar(gap, lv, la_f, tau=tau_f, present=vis)
       if vis:
         rs.leadOne.vRel = float(lv - ev)
+        rs.leadOne.radarTrackId = 2 if cut_done else 1
       # emulated model lead (vision): 0.2 s behind the truth, prob 0.9 while the lead is physically there
       model_lead = None
       if use_fusion:
@@ -518,9 +618,12 @@ def run(personality, sc):
       ss_mpc = should_stop(ev, a_mpc)
       a_cruise = LP.get_cruise_accel(v_cruise, ev, a_cruise, 0.05)
       ss_cruise = should_stop(ev, a_cruise)
-      a_e2e = None; ss_e2e = False
+      a_e2e = None; ss_e2e = False; model_stop_x = None
       if model is not None:
-        m = model.update(t, ex, ev)
+        _ml = [h for h in vis_hist if h[0] <= t - MODEL_LAG]
+        _mh = _ml[-1] if _ml else vis_hist[0]
+        m = model.update(t, ex, ev, lead_obs=(_mh[2], _mh[1], _mh[3]))
+        model_stop_x = ES.planned_stop_x(m) if ES is not None else None
         a_e2e = m.action.desiredAcceleration; ss_e2e = m.action.shouldStop
         if ES is not None:
           if es_state is not None:
@@ -532,13 +635,31 @@ def run(personality, sc):
       a_t = float(np.clip(min(a_mpc, a_cruise, a_e2e if a_e2e is not None else 9.0), ACCEL_MIN, ACCEL_MAX))
       ss = ss_mpc or ss_cruise or ss_e2e
       if launch is not None:
-        quick, a_t = _call_launch(launch, rs.leadOne, ev, standstill, fcw, a_t, a_e2e, ss_e2e, model_lead=model_lead)
+        quick, a_t = _call_launch(launch, rs.leadOne, ev, standstill, fcw, a_t, a_e2e, ss_e2e, model_lead=model_lead,
+                                  model_stop_x=model_stop_x, a_plan_radar=min(a_mpc, a_cruise), dt=0.05)
         if quick:
           ss = False
+        elif getattr(launch, "pending", False):
+          ss = False
+          a_t = LL.PRE_HOLD if a_t <= 0.0 else a_t
       if boost is not None:
-        on, a_t = boost.update(rs.leadOne, ev, standstill, fcw, personality, a_t, a_prev, 0.05, a_e2e, ss_e2e,
-                               model_lead=model_lead)
+        on, a_t = _call_launch(boost, rs.leadOne, ev, standstill, fcw, personality, a_t, a_prev, 0.05, a_e2e, ss_e2e,
+                               model_lead=model_lead, model_stop_x=model_stop_x, a_plan_radar=min(a_mpc, a_cruise))
         boost_on += int(on)
+        if on and BOOST_CLEARS_SS:
+          ss = False
+      if lock is not None:
+        lk_on, a_t = lock.update(rs.leadOne, ev, standstill, fcw, a_t, min(a_mpc, a_cruise),
+                                 launch_active=bool(quick or (boost is not None and boost.active)),
+                                 dt=0.05, stop_target=LL.stop_target() if LL is not None else None)
+        lock_on += int(lk_on)
+        if lk_on and a_t > 0.0:
+          ss = False
+      if TC is not None and sc.get("steer"):
+        ang, rate = steer_at(sc, t)
+        a_t = float(TC.cap_accel(a_t, ev, TC.curvature_from_angle(ang), ang, rate))
+        if abs(ang) > 30.0:
+          turn_peak_a = max(turn_peak_a, a_t)
       out_a = a_t; plan_a = a_t
       vdf.x = vdf.x + 0.05 * (out_a + a_prev) / 2.0
     CS = SimpleNamespace(vEgo=ev, aEgo=ea, brakePressed=False, standstill=ev < 1e-3,
@@ -577,6 +698,23 @@ def run(personality, sc):
         t_move_ref = round(t - t0v, 2)
     if t_clear is not None and t_move_clear is None and ev > 0.1:
       t_move_clear = round(t - t_clear, 2)
+    if t_launch0 is not None and t >= t_launch0:
+      if ego_a_onset is None and ea_eff > 0.05:
+        ego_a_onset = round(t - t_launch0, 3)
+      for dt_ in (0.5, 1.0, 2.0):
+        if dt_ not in a_at and t >= t_launch0 + dt_:
+          a_at[dt_] = round(ea_eff, 3)
+      for dt_ in (3.0, 5.0):
+        if dt_ not in gap_at and t >= t_launch0 + dt_:
+          gap_at[dt_] = round(lx - ex, 2) if physical(t) else None
+    if sc.get("steer"):
+      ang_, _ = steer_at(sc, t)
+      if abs(ang_) > 1.0:
+        lat_ = ev * ev * abs(TC.curvature_from_angle(ang_)) if TC is not None else 0.0
+        turn_peak_ea = max(turn_peak_ea, ea_eff)
+        turn_g["lat"] = max(turn_g.get("lat", 0.0), lat_ / 9.81)
+        turn_g["comb"] = max(turn_g.get("comb", 0.0), math.hypot(lat_, ea_eff) / 9.81)
+        turn_g["v_exit"] = ev
     st_w = sc["still"]
     if st_w is not None and st_w[0] <= t < st_w[1]:
       if still_x0 is None:
@@ -629,7 +767,14 @@ def run(personality, sc):
               t_5mph=tv.get(5), t_10mph=tv.get(10), t_20mph=tv.get(20), t_move_ref=t_move_ref,
               t_clear=None if t_clear is None or t_ref is None else round(t_clear - t_ref, 2), t_move_after_clear=t_move_clear,
               still_disp_m=round(still_disp, 3) if sc["still"] is not None else None, stop_comfort=stop_comfort,
-              boost_cycles=boost_on)
+              boost_cycles=boost_on, lock_cycles=lock_on, t_ego_accel_onset=ego_a_onset,
+              a_at_0_5=a_at.get(0.5), a_at_1_0=a_at.get(1.0), a_at_2_0=a_at.get(2.0),
+              gap_at_3=gap_at.get(3.0), gap_at_5=gap_at.get(5.0),
+              turn_peak_plan_a=round(turn_peak_a, 3) if sc.get("steer") else None,
+              turn_peak_accel=round(turn_peak_ea, 3) if sc.get("steer") else None,
+              turn_peak_lat_g=round(turn_g.get("lat", 0.0), 3) if sc.get("steer") else None,
+              turn_peak_comb_g=round(turn_g.get("comb", 0.0), 3) if sc.get("steer") else None,
+              turn_exit_mph=round(turn_g.get("v_exit", 0.0) / MPH, 1) if sc.get("steer") else None)
 
 
 if os.environ.get("SIM_NO_MAIN"):

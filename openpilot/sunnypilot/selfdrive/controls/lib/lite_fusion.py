@@ -24,7 +24,10 @@ from __future__ import annotations
 import math
 
 REQUIRE_RADAR = True
-REQUIRE_MODEL_AGREE = True
+# sunnypilot-lite-test-fix (Matt, Nov 14 road test): vision is OUT of the launch
+# decision. A radar-measured lead that pulls away is enough; the model's lead
+# speed (which lags at a launch) no longer has to agree. Kept as a flag only.
+REQUIRE_MODEL_AGREE = False
 # Off: sim showed the model's (lagged, camera-offset) lead distance blocking
 # quick launches in creep cycles, after which the stock launch ended up to
 # 13 cm closer to the lead than base. Kept for evaluation only.
@@ -69,3 +72,35 @@ def conservative_gap(lead, model_lead) -> float:
     if x is not None and math.isfinite(x):
       d = min(d, x - RADAR_TO_CAMERA)
   return d
+
+
+# --- driving-model stop vs. radar launch (sunnypilot-lite-test-fix) ---------
+# Root cause of "car does not move until I press the gas": behind a stopped
+# lead the driving model's e2e candidate keeps shouldStop and ~0 accel until
+# the MODEL sees the lead move and plans to go, and lite_e2e_stop clamps the
+# e2e accel to <= 0 at a standstill; the quick launch was blocked by that
+# shouldStop and capped at that accel. So the launch waited on the model (its
+# lag, or forever if it stays in "stop"). The radar launch now overrides the
+# model's stop EXCEPT when the model is clearly stopping for something other
+# than the lead: a planned stop more than LEAD_EXPLAINS_M short of the radar
+# lead, once the lead has already moved LINE_CONFIRM_M away from where it sat
+# (a stop line / sign / red light stays put while the lead leaves; a stop
+# caused by the lead moves with it). Once that happens the launch is disarmed
+# until the next standstill and the stock min (incl. the model) rules.
+LEAD_EXPLAINS_M = 5.0      # m (same as lite_e2e_stop)
+LINE_CONFIRM_M = 1.0       # m the lead must have moved before a short model stop counts as a line
+
+
+def model_stop_blocks(model_stop_x, d_rel: float, lead_moved: float) -> bool:
+  """True if the model plans a stop that the departing lead does not explain."""
+  if model_stop_x is None:
+    return False
+  try:
+    x = float(model_stop_x); d = float(d_rel); m = float(lead_moved)
+  except Exception:
+    return True
+  if not (math.isfinite(x) and math.isfinite(d)):
+    return True
+  if x + LEAD_EXPLAINS_M >= d:
+    return False  # the lead explains it (the model stops behind the lead)
+  return bool(math.isfinite(m) and m >= LINE_CONFIRM_M)

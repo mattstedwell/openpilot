@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import numpy as np
 from types import SimpleNamespace
 
@@ -17,10 +18,12 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
-from openpilot.sunnypilot.selfdrive.controls.lib.lite_launch import LiteLaunch
-from openpilot.sunnypilot.selfdrive.controls.lib.lite_e2e_stop import E2eStopState, shift_e2e_stop
+from openpilot.sunnypilot.selfdrive.controls.lib.lite_launch import PRE_HOLD, LiteLaunch, stop_target as lite_stop_target
+from openpilot.sunnypilot.selfdrive.controls.lib.lite_e2e_stop import E2eStopState, planned_stop_x, shift_e2e_stop
 from openpilot.sunnypilot.selfdrive.controls.lib.lite_lead_holdover import LeadHoldover
 from openpilot.sunnypilot.selfdrive.controls.lib.lite_launch_boost import LiteLaunchBoost
+from openpilot.sunnypilot.selfdrive.controls.lib.lite_lead_lock import LeadLock
+from openpilot.sunnypilot.selfdrive.controls.lib.lite_turn_cap import cap_accel as turn_cap_accel, curvature_from_angle
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -47,6 +50,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.lite_launch = LiteLaunch()
     self.launch_boost = LiteLaunchBoost()
     self.e2e_stop_state = E2eStopState()
+    self.lead_lock = LeadLock()
+    self.vm = None  # VehicleModel for the turn felt-g cap (lazy)
     self.lead_holdover = LeadHoldover()
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
@@ -122,6 +127,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     output_should_stop_mpc = should_stop(v_ego, output_a_target_mpc)
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
+    model_stop_x = planned_stop_x(sm['modelV2'])  # the model's own planned stop (before the lite 10 ft shift)
     # dev-c4-sunnypilot-lite: stop ~10 ft before the model's planned stop at
     # lights / stop signs (skipped when a lead explains the stop; the lead
     # MPC already adds 10 ft there). Can only lower accel or add shouldStop.
@@ -151,19 +157,54 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.lite_launch.reset()
       self.launch_boost.reset()
       self.e2e_stop_state.reset()
+      self.lead_lock.reset()
+    # sunnypilot-lite-test-fix: radar-only launch. The model's e2e stop no longer
+    # holds the launch unless it is a stop the lead does not explain (line /
+    # sign / light, lite_fusion.model_stop_blocks); the "plan not braking" gate
+    # uses the stock plan without the model candidate.
+    a_plan_radar = min(output_a_target_mpc, self.a_cruise)
     quick_start, output_a_target = self.lite_launch.update(sm['radarState'].leadOne, v_ego, sm['carState'].standstill,
                                                            self.fcw, output_a_target, output_a_target_e2e,
-                                                           output_should_stop_e2e, model_lead=model_lead)
+                                                           output_should_stop_e2e, model_lead=model_lead,
+                                                           model_stop_x=model_stop_x, a_plan_radar=a_plan_radar, dt=self.dt)
     if quick_start:
       self.output_should_stop = False
+    elif self.lite_launch.pending:
+      # pre-release: light brake hold (still braking, no motion) while the radar lead starts to roll
+      self.output_should_stop = False
+      output_a_target = PRE_HOLD if output_a_target <= 0.0 else output_a_target
     # sunnypilot-lite launchboost: stronger take-up behind a lead pulling away
     # from a stop (floor only; gates and fades in lite_launch_boost.py).
-    _, output_a_target = self.launch_boost.update(sm['radarState'].leadOne, v_ego, sm['carState'].standstill, self.fcw,
-                                                  sm['selfdriveState'].personality, output_a_target, a_prev, self.dt,
-                                                  output_a_target_e2e, output_should_stop_e2e, model_lead=model_lead)
+    boost_on, output_a_target = self.launch_boost.update(sm['radarState'].leadOne, v_ego, sm['carState'].standstill, self.fcw,
+                                                         sm['selfdriveState'].personality, output_a_target, a_prev, self.dt,
+                                                         output_a_target_e2e, output_should_stop_e2e, model_lead=model_lead,
+                                                         model_stop_x=model_stop_x, a_plan_radar=a_plan_radar)
+    if boost_on:
+      self.output_should_stop = False
+    # stop-and-go lead lock: right after both cars stop, up to 5 mph, follow the radar lead's accel
+    # (feed-forward) and hold the stopped gap; hard safety overrides in lite_lead_lock.py.
+    lock_on, output_a_target = self.lead_lock.update(sm['radarState'].leadOne, v_ego, sm['carState'].standstill, self.fcw,
+                                                     output_a_target, a_plan_radar,
+                                                     launch_active=bool(quick_start or boost_on),
+                                                     dt=self.dt, stop_target=lite_stop_target())
+    if lock_on and output_a_target > 0.0:
+      self.output_should_stop = False
+    # no hard accel into low-speed intersection turns (steering angle + lat accel), after every launch path
+    output_a_target = turn_cap_accel(output_a_target, v_ego, self.turn_curvature(sm['carState']),
+                                     sm['carState'].steeringAngleDeg, sm['carState'].steeringRateDeg)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
+
+  def turn_curvature(self, CS) -> float:
+    """Path curvature (1/m) from the steering wheel angle (VehicleModel when available)."""
+    try:
+      if self.vm is None:
+        from opendbc.car.vehicle_model import VehicleModel
+        self.vm = VehicleModel(self.CP)
+      return float(self.vm.calc_curvature(math.radians(CS.steeringAngleDeg), max(CS.vEgo, 0.1), 0.0))
+    except Exception:
+      return curvature_from_angle(CS.steeringAngleDeg)
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')

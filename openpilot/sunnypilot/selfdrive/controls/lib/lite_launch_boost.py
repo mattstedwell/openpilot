@@ -42,9 +42,12 @@ from __future__ import annotations
 import math
 
 from openpilot.cereal import log
-from openpilot.sunnypilot.selfdrive.controls.lib.lite_fusion import conservative_gap, lead_moving_agreed
+from openpilot.sunnypilot.selfdrive.controls.lib.lite_fusion import conservative_gap, lead_moving_agreed, model_stop_blocks
 
-ENABLED = False  # backed off: see module docstring (sim regressions after a launch)
+# sunnypilot-lite-test-fix: ON again (Matt: launch too slow / leaves far too much
+# room in city traffic). Radar-only gate; the driving model only disarms it when
+# it plans a stop the lead does not explain (lite_fusion.model_stop_blocks).
+ENABLED = True
 MPH = 0.44704
 _P = log.LongitudinalPersonality
 FULL = {_P.aggressive: 2.0, _P.standard: 1.8, _P.relaxed: 1.6}
@@ -58,6 +61,8 @@ A_LEAD_MIN = -0.05         # m/s^2: lead not slowing
 A_PLAN_MIN = -0.20         # m/s^2: stock plan not braking
 ARM_V = 0.05               # m/s
 SET_GAP_TOL = 0.05         # m
+MISSING_MAX_S = 1.0   # s of radar dropout tolerated before disarming
+MIN_REF_GAP = 4.0          # m: (fix) reference standstill gap never below this
 # Worst-case stop check: if the lead slammed on the brakes right now
 # (PROJ_LEAD_BRAKE) and we only started braking PROJ_REACT later at
 # PROJ_EGO_BRAKE, we must still stop at least the full set gap (+ margin)
@@ -100,13 +105,16 @@ def projected_stop_gap(d: float, v_ego: float, v_lead: float) -> float:
   return float(d) + v_lead * v_lead / (2.0 * PROJ_LEAD_BRAKE) - (v_ego * PROJ_REACT + v_ego * v_ego / (2.0 * PROJ_EGO_BRAKE))
 
 
-def boost_target(lead, v_ego: float, personality, d: float | None = None) -> float:
+def boost_target(lead, v_ego: float, personality, d: float | None = None, ref_gap: float | None = None) -> float:
+  """ref_gap: the standstill gap the hard-stop check must keep (default the
+  stop target; the fix passes min(stop target, where we actually stopped))."""
   v_lead = float(lead.vLead)
   d = float(lead.dRel) if d is None else float(d)
   full = FULL.get(personality, FULL[_P.standard])
   dv = min(max((v_lead - v_ego) / DV_FADE, 0.0), 1.0)
   g = min(max((d - desired_gap(v_ego, v_lead, personality)) / GAP_FADE_M, 0.0), 1.0)
-  pg = projected_stop_gap(d, v_ego, v_lead) - (stop_target() + PROJ_MARGIN)
+  ref = stop_target() if ref_gap is None else min(float(ref_gap), stop_target())
+  pg = projected_stop_gap(d, v_ego, v_lead) - (ref + PROJ_MARGIN)
   gp = min(max(pg / PROJ_FADE_M, 0.0), 1.0)
   return full * speed_weight(v_ego) * dv * g * gp
 
@@ -116,14 +124,24 @@ class LiteLaunchBoost:
     self.reset()
 
   def reset(self):
+    self.missing = 0.0
     self.armed = False
     self.active = False
     self.floor = 0.0
+    self.d_ref = None
+    self.travel = 0.0
 
   def update(self, lead, v_ego: float, standstill: bool, fcw: bool, personality, a_target: float,
              a_prev: float, dt: float, a_e2e: float | None = None, e2e_should_stop: bool = False,
-             model_lead=None) -> tuple[bool, float]:
-    """Returns (active, a_target). a_target is never lowered."""
+             model_lead=None, model_stop_x=None, a_plan_radar: float | None = None) -> tuple[bool, float]:
+    """Returns (active, a_target). a_target is never lowered.
+
+    sunnypilot-lite-test-fix: the model's e2e shouldStop / accel no longer
+    disarm or cap the boost (they held the launch back behind a departing
+    radar lead). A model stop the lead does not explain still disarms it for
+    the rest of the launch. a_plan_radar = stock plan without the model
+    candidate (lead MPC / cruise), used for the "not braking" gate.
+    """
     self.active = False
     self.floor = 0.0
     if not ENABLED:
@@ -131,26 +149,36 @@ class LiteLaunchBoost:
       return False, a_target
     present = lead is not None and lead.present
     v_ego = float(v_ego)
-    if not present or v_ego >= TAPER_END_V:
+    # a brief radar dropout keeps the standstill reference (as lite_launch); longer -> disarm
+    self.missing = 0.0 if present else self.missing + float(dt)
+    if v_ego >= TAPER_END_V or self.missing > MISSING_MAX_S:
       self.armed = False
+      self.d_ref = None
+    if not present or v_ego >= TAPER_END_V:
       return False, a_target
     if standstill or v_ego < ARM_V:
       self.armed = True
+      self.travel = 0.0
+      if float(lead.vLead) < 0.1:
+        self.d_ref = float(lead.dRel)
+    else:
+      self.travel += max(v_ego, 0.0) * float(dt)
     if not self.armed:
       return False, a_target
     a_lead = float(lead.aLeadK)
-    if fcw or e2e_should_stop or a_lead < A_LEAD_MIN or float(a_target) <= A_PLAN_MIN:
-      self.armed = False  # never boost toward a slowing lead / model stop / braking plan this launch
+    a_gate = float(a_target) if a_plan_radar is None else float(a_plan_radar)
+    moved = 0.0 if self.d_ref is None else float(lead.dRel) + self.travel - self.d_ref
+    if fcw or a_lead < A_LEAD_MIN or a_gate <= A_PLAN_MIN or model_stop_blocks(model_stop_x, float(lead.dRel), moved):
+      self.armed = False  # never boost toward a slowing lead / unexplained model stop / braking plan this launch
       return False, a_target
-    if not lead_moving_agreed(lead, model_lead):  # radar-measured, vision agrees (or absent)
+    if not lead_moving_agreed(lead, model_lead):  # radar-measured lead
       return False, a_target
     v_lead = float(lead.vLead)
     d = conservative_gap(lead, model_lead)
-    if v_lead < V_LEAD_MIN or v_lead <= v_ego or d < stop_target() - SET_GAP_TOL:
+    ref = stop_target() if self.d_ref is None else min(stop_target(), max(self.d_ref, MIN_REF_GAP))
+    if v_lead < V_LEAD_MIN or v_lead <= v_ego or d < ref - SET_GAP_TOL:
       return False, a_target
-    tgt = boost_target(lead, v_ego, personality, d)
-    if a_e2e is not None:
-      tgt = min(tgt, float(a_e2e))
+    tgt = boost_target(lead, v_ego, personality, d, ref_gap=ref)
     floor = min(tgt, max(float(a_prev), float(a_target)) + JERK_UP * dt)
     if floor <= a_target:
       return False, a_target

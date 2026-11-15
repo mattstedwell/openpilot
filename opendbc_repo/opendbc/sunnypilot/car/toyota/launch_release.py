@@ -21,10 +21,21 @@ LAUNCH_RELEASE_V_MAX = 0.1   # m/s; standstill only
 LAUNCH_RELEASE_A_MIN = 0.0   # m/s²; request must be positive
 
 
+# sunnypilot-lite-test-fix: the planner's launch pre-release asks for a light
+# brake hold (about -0.5) while the radar lead starts to roll. At a standstill in
+# pid, a request in [PRE_RELEASE_MIN, 0] that is lighter than the previous
+# command is taken in one step too (still a brake request; the car stays put).
+PRE_RELEASE_MIN = -0.6       # m/s²; deeper requests keep the official winddown
+
+
 def release_prev_accel(prev_accel, accel_request, v_ego, pid_active, long_active):
   if not (long_active and pid_active):
     return prev_accel
-  if v_ego >= LAUNCH_RELEASE_V_MAX or accel_request <= LAUNCH_RELEASE_A_MIN:
+  if v_ego >= LAUNCH_RELEASE_V_MAX:
+    return prev_accel
+  if accel_request <= LAUNCH_RELEASE_A_MIN:
+    if PRE_RELEASE_MIN <= accel_request and prev_accel < accel_request:
+      return accel_request
     return prev_accel
   if prev_accel >= LAUNCH_RELEASE_HOLD:
     return prev_accel

@@ -59,7 +59,11 @@ class TestLeadStopExtra(unittest.TestCase):
 class TestLaunchRelease(unittest.TestCase):
   def test_release_only_standstill_pid_positive(self):
     self.assertEqual(release_prev_accel(-2.0, 0.5, 0.0, True, True), LAUNCH_RELEASE_HOLD)
-    self.assertEqual(release_prev_accel(-2.0, -0.1, 0.0, True, True), -2.0)  # braking untouched
+    self.assertEqual(release_prev_accel(-2.0, -1.0, 0.0, True, True), -2.0)  # deeper braking untouched
+    # sunnypilot-lite-test2 pre-release: a light brake request (>= PRE_RELEASE_MIN) is taken in one step
+    self.assertEqual(release_prev_accel(-2.0, -0.5, 0.0, True, True), -0.5)
+    self.assertEqual(release_prev_accel(-0.3, -0.5, 0.0, True, True), -0.3)  # never lighter -> deeper jump
+    self.assertEqual(release_prev_accel(-2.0, -0.5, 0.5, True, True), -2.0)  # moving: official winddown
     self.assertEqual(release_prev_accel(-2.0, 0.5, 0.0, False, True), -2.0)  # still Stopping
     self.assertEqual(release_prev_accel(-2.0, 0.5, 0.5, True, True), -2.0)   # moving
     self.assertEqual(release_prev_accel(-2.0, 0.5, 0.0, True, False), -2.0)  # not active
@@ -109,7 +113,6 @@ class TestLiteLaunchGates(unittest.TestCase):
       "lead lost": dict(ld=lead(present=False)),
       "fcw": dict(ld=lead(d=9.4, v=0.6, a=0.3), fcw=True),
       "plan braking": dict(ld=lead(d=9.4, v=0.6, a=0.3), a=-0.5),
-      "model stop": dict(ld=lead(d=9.4, v=0.6, a=0.3), ss_e2e=True),
       "not faster than ego": dict(ld=lead(d=9.4, v=0.6, a=0.3), v_ego=0.5),
     }
     for name, kw in cases.items():
@@ -126,10 +129,28 @@ class TestLiteLaunchGates(unittest.TestCase):
     q, _ = self.go(lead(d=12.0, v=3.0, a=0.5), v_ego=1.0)
     self.assertFalse(q)  # disarmed until the next standstill
 
-  def test_floor_capped_by_model(self):
-    q, a = self.go(lead(d=9.4, v=0.6, a=0.5), a=0.05, a_e2e=0.1)
+  def test_floor_not_capped_by_model(self):
+    # sunnypilot-lite-test2 (radar-only launch): the model's e2e accel / shouldStop no longer hold the launch
+    q, a = self.go(lead(d=9.4, v=0.6, a=0.5), a=0.05, a_e2e=0.1, ss_e2e=True)
     self.assertTrue(q)
-    self.assertAlmostEqual(a, 0.1)
+    self.assertAlmostEqual(a, LL.LAUNCH_FLOOR)
+
+  def test_model_line_stop_disarms(self):
+    # a model stop the departing lead does not explain (stop line) disarms until the next standstill
+    for _ in range(3):
+      q, a = self.l.update(lead(d=11.0, v=0.6, a=0.5), 0.0, True, False, 0.05, model_stop_x=1.0)
+    self.assertFalse(q)
+    self.assertTrue(self.l.model_blocked)
+
+  def test_brief_dropout_keeps_reference(self):
+    for _ in range(4):  # 0.2 s radar dropout
+      self.l.update(lead(present=False), 0.0, True, False, 0.0)
+    self.assertIsNotNone(self.l.d_ref)
+    q, a = self.go(lead(d=9.4, v=0.6, a=0.5))
+    self.assertTrue(q)
+    for _ in range(int(LL.MISSING_MAX_S / 0.05) + 2):
+      self.l.update(lead(present=False), 0.0, True, False, 0.0)
+    self.assertIsNone(self.l.d_ref)
 
   def test_unlatched_gate_drops_immediately(self):
     self.go(lead(d=9.4, v=0.6, a=0.5))
@@ -326,7 +347,8 @@ class TestClosedLoopMpc(unittest.TestCase):
     cls.res = {}
     with tempfile.TemporaryDirectory() as d:
       for name, cand in (("stock", {"name": "stock"}),
-                         ("lite", {"name": "lite", "extra": True, "release": True, "launch": True, "holdover": True})):
+                         ("lite", {"name": "lite", "extra": True, "release": True, "launch": True, "holdover": True,
+                                   "boost": True, "boost_clears_ss": True, "lock": True, "turncap": True})):
         out = Path(d) / f"{name}.json"
         env = dict(os.environ)
         subprocess.run([sys.executable, str(HERE / "sp_lite_launch_sim.py"), str(TREE), build, str(out),
