@@ -1,14 +1,18 @@
 """sunnypilot-lite: open the follow gap a little faster after a launch from a stop.
 
 Matt (Nov 15 2026): after accelerating from a stop behind a lead, the gap sags
-below the personality follow distance (host sim: Aggressive ~45-54 ft vs the
-~58 ft target at 20 mph, recovering in 11-17 s). Stock MPC does the same: ego
+below the personality follow distance. Stock MPC does the same: ego
 overshoots the lead's speed when the lead finishes accelerating.
+
+A later request (same day) raised the ease-off from about 1 mph under the lead
+to about 2 mph (V_OPEN = 2.0 * MPH). The accel floor stays -0.3 m/s^2; a
+deeper lift was not needed, and a brief -0.5 probe did not help ego sit any
+closer to 2 mph under the lead.
 
 After a standstill launch, once lead lock has handed off (6.5 mph) and the
 first MIN_MOTION_S of the launch have passed, if the gap is still below
 T_FOLLOW*v_ego + STOP_DISTANCE and the lead is not braking, this softly caps
-ego accel so ego sits slightly under the lead's speed (V_OPEN). That keeps
+ego accel so ego sits about 2 mph under the lead's speed (V_OPEN). That keeps
 the gap opening instead of shrinking, then fades out as the gap reaches
 TARGET_FRAC of the target.
 
@@ -44,7 +48,7 @@ END_V = 35.0 * MPH           # m/s: episode ends (highway / leaving the launch)
 MAX_EPISODE_S = 25.0         # s after first motion
 TARGET_FRAC = 0.95           # fade the cap out by this fraction of T_FOLLOW*v + STOP
 FADE_START_FRAC = 0.80       # full effect at or below this fraction
-V_OPEN = 0.40                # m/s (~0.9 mph): sit this much under the lead so the gap opens
+V_OPEN = 2.0 * MPH            # m/s (~2 mph): sit this much under the lead so the gap opens
 TAU = 1.2                    # s: speed error -> accel
 A_FLOOR = -0.30              # m/s^2: never command more than a light ease-off
 A_LEAD_MIN = -0.30           # m/s^2: lead not braking

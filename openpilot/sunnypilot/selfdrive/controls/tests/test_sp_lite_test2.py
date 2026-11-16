@@ -256,6 +256,11 @@ class TestGapOpen(unittest.TestCase):
       on, a = self.step(rl(d=d, v=v_lead, a=a_lead), v_ego=v, a_t=a_t, a_prev=a)
     return on, a
 
+  def test_v_open_is_about_2_mph(self):
+    self.assertAlmostEqual(GO.V_OPEN, 2.0 * MPH, places=3)
+    # floor stays a light ease-off; 2 mph under is a setpoint, not a harder brake
+    self.assertAlmostEqual(GO.A_FLOOR, -0.30, places=2)
+
   def test_follow_times_unchanged(self):
     from openpilot.cereal import log
     self.assertAlmostEqual(LM.get_T_FOLLOW(log.LongitudinalPersonality.aggressive), 1.25)
