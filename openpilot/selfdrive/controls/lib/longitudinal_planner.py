@@ -184,7 +184,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                                                          model_stop_x=model_stop_x, a_plan_radar=a_plan_radar)
     if boost_on:
       self.output_should_stop = False
-    # stop-and-go lead lock: right after both cars stop, up to 10 mph, follow the radar lead's accel
+    # stop-and-go lead lock: right after both cars stop, up to 5 mph, follow the radar lead's accel
     # (feed-forward) and hold the stopped gap; hard safety overrides in lite_lead_lock.py.
     lock_on, output_a_target = self.lead_lock.update(sm['radarState'].leadOne, v_ego, sm['carState'].standstill, self.fcw,
                                                      output_a_target, a_plan_radar,
@@ -193,9 +193,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     if lock_on and output_a_target > 0.0:
       self.output_should_stop = False
     # after a standstill launch, softly ease off under the lead if the gap is still
-    # below the follow distance. Below 11.5 mph this is a no-op (normal launch / lock
-    # / boost; lock hands off by 11.5). From 11.5 mph the under-lead offset ramps in
-    # (full by 15.5 mph) and
+    # below the follow distance. Below 10 mph this is a no-op (normal launch / lock
+    # / boost). From 10 mph the under-lead offset ramps in (full by 14 mph) and
     # shrinks smoothly to 0 as the gap reaches 100% of target. The cap's own
     # ease-off is limited to about -0.10 m/s^2 and is blended back to the plan as
     # the gap fills, so the release is gradual. Applied as min() on top of
