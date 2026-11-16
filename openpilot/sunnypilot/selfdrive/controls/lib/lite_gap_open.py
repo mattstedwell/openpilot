@@ -7,14 +7,17 @@ overshoots the lead's speed when the lead finishes accelerating.
 A later request (same day) raised the ease-off from about 1 mph under the lead
 to about 2 mph (V_OPEN = 2.0 * MPH). The accel floor stays -0.3 m/s^2.
 
-A follow-up requested a ramp-in during the launch (originally 2.5 to 6.5 mph).
-Matt then asked to leave the launch alone until 10 mph: below 10 mph the
+A follow-up requested a ramp-in during the launch (originally 2.5 to 6.5 mph,
+then 10 to 14 mph). With lead lock now holding to 10 mph and handing off by
+11.5 mph, gap-open must not start until that handoff completes, otherwise
+the ease-off would fight the lock. Below RAMP_START_V (11.5 mph) the
 module behaves exactly like no gap-open (normal launch, lead lock, and
 boost). The ease-off episode is not started, and the cap is not applied,
-until ego reaches RAMP_START_V (10 mph). From there the under-lead offset
-ramps with a C2 smootherstep to the full V_OPEN at RAMP_END_V (14 mph).
-Standstill behind a lead still marks the car eligible, so a later 10 mph
-crossing can start the episode; eligibility alone does not change accel.
+until ego reaches RAMP_START_V. From there the under-lead offset ramps
+with a C2 smootherstep to the full V_OPEN at RAMP_END_V (15.5 mph, a 4 mph
+window as before). Standstill behind a lead still marks the car eligible,
+so a later 11.5 mph crossing can start the episode; eligibility alone
+does not change accel.
 
 The offset itself is also proportional to how short the gap is, so it stays
 human-like: up to ~2 mph under the lead when the gap is well short of the
@@ -33,7 +36,7 @@ an abrupt lift. There is no fixed 2 mph hold after the gap is closed.
 
 The cap is min()'d with the incoming plan, including while launch_boost and
 lead_lock are still active. Those hooks still run first (boost may raise the
-accel floor; lock holds the stopped gap to 5 mph and keeps its safety
+accel floor; lock holds the stopped gap to 10 mph and keeps its safety
 overrides). Gap-open can only reduce accel, never weaken braking, and it
 drops immediately if the lead is slowing, stopped, missing, or FCW is set,
 so a stopped or slowing lead is never ignored.
@@ -42,11 +45,11 @@ Constraints (all enforced here and in the planner hook):
   * gas ease-off only: the cap is min()'d with the incoming plan, so it never
     weakens braking. The cap's own command is limited to A_SOFT (~-0.10 m/s^2);
     A_FLOOR (-0.3 m/s^2) remains only a hard bound.
-  * below RAMP_START_V (10 mph) the launch is not touched, so take-up,
-    t_move, lead lock and the first part of boost stay stock. The ease-off
-    episode is not started before 10 mph.
+  * below RAMP_START_V (11.5 mph, after the lead-lock handoff) the launch
+    is not touched, so take-up, t_move, lead lock and the first part of
+    boost stay stock. The ease-off episode is not started before 11.5 mph.
   * eligibility is remembered from a standstill behind a lead, but the
-    episode itself starts only at 10 mph; it expires at END_V (~35 mph) or
+    episode itself starts only at 11.5 mph; it expires at END_V (~35 mph) or
     MAX_EPISODE_S, so steady moving follow is unchanged. Reaching 100% of
     the target turns the cap off; it does not end the episode.
   * a slowing / braking lead, FCW, or a missing lead drops the cap immediately
@@ -68,10 +71,10 @@ from openpilot.cereal import log
 ENABLED = True
 MPH = 0.44704
 ARM_V = 0.05                 # m/s: arm only from a standstill
-RAMP_START_V = 10.0 * MPH    # m/s: start blending the under-lead offset in
-RAMP_END_V = 14.0 * MPH      # m/s: full speed-ramp from here
+RAMP_START_V = 11.5 * MPH    # m/s: start after lead-lock handoff completes
+RAMP_END_V = 15.5 * MPH      # m/s: full speed-ramp from here (4 mph window)
 END_V = 35.0 * MPH           # m/s: episode ends (highway / leaving the launch)
-MAX_EPISODE_S = 25.0         # s after the episode starts (at 10 mph)
+MAX_EPISODE_S = 25.0         # s after the episode starts (at 11.5 mph)
 SHORT_FRAC = 0.90            # full V_OPEN at or below this fraction of the target gap
 V_OPEN = 2.0 * MPH           # m/s (~2 mph): max under-lead offset when the gap is well short
 TAU = 1.2                    # s: speed error -> accel
@@ -117,7 +120,7 @@ def gap_short_scale(gap: float, desired: float) -> float:
 def v_open_offset(v_ego: float, gap: float | None = None, desired: float | None = None) -> float:
   """Ramped, gap-proportional under-lead offset (m/s).
 
-  Speed ramp: 0 until 10 mph, full scale by 14 mph. If gap and desired are
+  Speed ramp: 0 until 11.5 mph, full scale by 15.5 mph. If gap and desired are
   given, also shrinks to 0 as the gap reaches 100% of the follow target.
   """
   scale = v_open_scale(v_ego)
@@ -184,8 +187,9 @@ class LiteGapOpen:
     self.missing = 0.0 if present else self.missing + dt
 
     # Remember eligibility from a standstill behind a lead, but do not start
-    # the ease-off episode (or apply any cap) before 10 mph. Below that, accel
-    # is exactly the incoming plan (launch / lock / boost are untouched).
+    # the ease-off episode (or apply any cap) before 11.5 mph (after the
+    # lead-lock handoff). Below that, accel is exactly the incoming plan
+    # (launch / lock / boost are untouched).
     if standstill or v_ego < ARM_V:
       if present:
         self.armed = True
@@ -200,7 +204,7 @@ class LiteGapOpen:
         self.motion_t = 0.0
       return False, a_target
 
-    # still below the 10 mph start: eligible, but the episode has not armed
+    # still below the 11.5 mph start: eligible, but the episode has not armed
     if v_ego < RAMP_START_V:
       self.applied = a_target
       return False, a_target
@@ -217,7 +221,7 @@ class LiteGapOpen:
     if v_ego >= END_V or self.motion_t >= MAX_EPISODE_S or self.missing > MISSING_MAX_S:
       return self._end_episode(a_target)
 
-    # below 10 mph is already returned above; v_scale is 0 until RAMP_START_V
+    # below 11.5 mph is already returned above; v_scale is 0 until RAMP_START_V
     v_scale = v_open_scale(v_ego)
     if v_scale <= 1e-3 or not present or fcw:
       self.applied = a_target

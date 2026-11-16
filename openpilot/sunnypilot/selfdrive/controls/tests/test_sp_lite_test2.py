@@ -121,16 +121,38 @@ class TestLeadLock(unittest.TestCase):
 
   def test_released_above_end_speed(self):
     self.lock()
-    on, a = self.step(rl(d=15.0, v=5.0, a=1.0), v_ego=LK.END_V + 0.01, a_t=0.4)
+    # lead still pulling away, plenty of room: follow-lock is off, command passes through
+    on, a = self.step(rl(d=25.0, v=LK.END_V + 2.0, a=1.0), v_ego=LK.END_V + 0.01, a_t=0.4, a_plan=0.4)
     self.assertFalse(on); self.assertEqual(a, 0.4)
     self.assertFalse(self.lk.locked)
+    self.assertTrue(self.lk.protect)
+
+  def test_post_handoff_does_not_overshoot_lead(self):
+    """After 11.5 mph the planner must not punch above the lead to close a residual gap."""
+    self.lock()
+    # already slightly faster than the lead: no more positive accel
+    on, a = self.step(rl(d=20.0, v=LK.END_V, a=0.5), v_ego=LK.END_V + 0.3, a_t=2.0, a_plan=2.0)
+    self.assertFalse(on)
+    self.assertFalse(self.lk.locked)
+    self.assertTrue(self.lk.protect)
+    self.assertLessEqual(a, 0.0)
+    # lead faster: some catch-up is allowed, but not more than the speed-match cap
+    on, a = self.step(rl(d=20.0, v=LK.END_V + 1.5, a=0.5), v_ego=LK.END_V + 0.3, a_t=2.0, a_plan=2.0)
+    self.assertFalse(on)
+    self.assertGreater(a, 0.0)
+    self.assertLess(a, 2.0)
 
   def test_blend_weight(self):
     self.assertEqual(LK._w(0.0), 1.0)
     self.assertEqual(LK._w(LK.FULL_V), 1.0)
     self.assertEqual(LK._w(LK.END_V), 0.0)
-    w = [LK._w(v) for v in np.linspace(0, 4, 200)]
+    w = [LK._w(v) for v in np.linspace(0, LK.END_V + 1.0, 400)]
     self.assertTrue(all(b <= a + 1e-12 for a, b in zip(w, w[1:])))
+    self.assertAlmostEqual(LK.FULL_V, 10.0 * 0.44704, places=6)
+    self.assertAlmostEqual(LK.END_V, 11.5 * 0.44704, places=6)
+    self.assertAlmostEqual(LK._w(10.0 * 0.44704), 1.0, places=6)
+    self.assertGreater(LK._w(10.75 * 0.44704), 0.15)
+    self.assertLess(LK._w(10.75 * 0.44704), 0.85)
 
   def test_safety_overrides_take_plan_min(self):
     self.lock()
@@ -236,7 +258,7 @@ class TestTurnCap(unittest.TestCase):
 
 
 class TestGapOpen(unittest.TestCase):
-  """Post-launch soft accel cap: ramp to ~2 mph under the lead from 10 to 14 mph."""
+  """Post-launch soft accel cap: ramp to ~2 mph under the lead from 11.5 to 15.5 mph."""
 
   def setUp(self):
     self.go = GO.LiteGapOpen()
@@ -252,7 +274,7 @@ class TestGapOpen(unittest.TestCase):
                           lock_active=lock, boost_active=boost)
 
   def arm_and_roll(self, t=1.2, v0=0.0, v1=8.0, d=14.0, v_lead=9.0, a_lead=0.0, a_t=1.0):
-    """Standstill eligibility, then roll past the 10-14 mph ramp so the cap may apply."""
+    """Standstill eligibility, then roll past the 11.5-15.5 mph ramp so the cap may apply."""
     self.step(rl(d=9.05), v_ego=0.0, standstill=True, a_t=-0.5, a_prev=-0.5)
     n = max(int(round(t / DT)), 1)
     a = a_t
@@ -291,17 +313,19 @@ class TestGapOpen(unittest.TestCase):
     v = GO.RAMP_START_V - 0.05
     on, a = self.step(rl(d=10.0, v=3.0, a=1.0), v_ego=v, a_t=1.5, a_prev=-0.5)
     self.assertFalse(on); self.assertEqual(a, 1.5)
-    self.assertFalse(self.go.episode)  # episode must not arm before 10 mph
+    self.assertFalse(self.go.episode)  # episode must not arm before 11.5 mph
     for _ in range(int(1.0 / DT)):
       on, a = self.step(rl(d=10.0, v=3.0, a=1.0), v_ego=v, a_t=1.5, a_prev=1.5)
     self.assertFalse(on); self.assertEqual(a, 1.5)
     self.assertFalse(self.go.episode)
-    # lead-lock handoff speed (6.5 mph) is also still a no-op
-    v_lock = 6.5 * MPH
-    self.assertLess(v_lock, GO.RAMP_START_V)
-    on, a = self.step(rl(d=10.0, v=v_lock + 1.0, a=1.0), v_ego=v_lock, a_t=1.5, a_prev=1.5)
-    self.assertFalse(on); self.assertEqual(a, 1.5)
-    self.assertFalse(self.go.episode)
+    # full lock (10 mph) and mid-handoff are still a no-op; gap-open starts after END_V
+    for v_lock in (6.5 * MPH, 10.0 * MPH, LK.END_V - 0.05):
+      self.assertLess(v_lock, GO.RAMP_START_V)
+      on, a = self.step(rl(d=10.0, v=v_lock + 1.0, a=1.0), v_ego=v_lock, a_t=1.5, a_prev=1.5)
+      self.assertFalse(on); self.assertEqual(a, 1.5)
+      self.assertFalse(self.go.episode)
+    # exactly at lock END_V / gap-open start: episode may begin, but scale is still 0
+    self.assertAlmostEqual(LK.END_V, GO.RAMP_START_V, places=6)
 
   def test_min_on_top_of_lock_or_boost(self):
     """Cap may apply while lock/boost are still flagged; it only reduces accel."""
@@ -320,15 +344,17 @@ class TestGapOpen(unittest.TestCase):
     on, a = self.step(rl(d=13.0, v=v, a=-0.8), v_ego=v, a_t=0.4, a_prev=0.4, lock=True, boost=True)
     self.assertFalse(on); self.assertEqual(a, 0.4)
 
-  def test_ramp_reaches_full_offset_at_14_mph(self):
-    self.assertAlmostEqual(GO.RAMP_START_V, 10.0 * MPH, places=3)
-    self.assertAlmostEqual(GO.RAMP_END_V, 14.0 * MPH, places=3)
+  def test_ramp_reaches_full_offset_at_15p5_mph(self):
+    self.assertAlmostEqual(GO.RAMP_START_V, 11.5 * MPH, places=3)
+    self.assertAlmostEqual(GO.RAMP_END_V, 15.5 * MPH, places=3)
+    self.assertAlmostEqual(GO.RAMP_START_V, LK.END_V, places=6)
     self.assertAlmostEqual(GO.v_open_scale(0.0), 0.0, places=6)
     self.assertAlmostEqual(GO.v_open_scale(GO.RAMP_START_V), 0.0, places=6)
     self.assertAlmostEqual(GO.v_open_offset(GO.RAMP_START_V), 0.0, places=6)
-    # just below start: still zero; at 14 and above: full 2 mph
+    # just below start: still zero; at 10 mph still zero; at 15.5 and above: full 2 mph
     self.assertAlmostEqual(GO.v_open_scale(GO.RAMP_START_V - 0.05), 0.0, places=6)
     self.assertAlmostEqual(GO.v_open_scale(6.5 * MPH), 0.0, places=6)
+    self.assertAlmostEqual(GO.v_open_scale(10.0 * MPH), 0.0, places=6)
     self.assertAlmostEqual(GO.v_open_scale(GO.RAMP_END_V), 1.0, places=6)
     self.assertAlmostEqual(GO.v_open_offset(GO.RAMP_END_V), GO.V_OPEN, places=6)
     self.assertAlmostEqual(GO.v_open_offset(GO.RAMP_END_V + 1.0), GO.V_OPEN, places=6)
@@ -344,7 +370,7 @@ class TestGapOpen(unittest.TestCase):
     self.assertLess(scales[1] - scales[0], scales[len(scales)//2] - scales[len(scales)//2 - 1])
 
   def test_partial_cap_during_ramp_and_full_at_handoff(self):
-    """By 14 mph the cap uses the full 2 mph offset; mid-ramp uses a smaller one."""
+    """By 15.5 mph the cap uses the full 2 mph offset; mid-ramp uses a smaller one."""
     # mid-ramp: ego matching lead, short gap -> cap, but less than full V_OPEN would demand
     v_mid = 0.5 * (GO.RAMP_START_V + GO.RAMP_END_V)
     des_mid = GO.desired_follow_gap(v_mid, self.p)
@@ -357,7 +383,7 @@ class TestGapOpen(unittest.TestCase):
     mid_off = GO.v_open_offset(v_mid)
     on, a = self.arm_and_roll(t=1.2, v1=v_mid, d=0.7 * des_mid, v_lead=v_mid + mid_off + 0.2, a_lead=0.2, a_t=1.5)
     self.assertFalse(on); self.assertEqual(a, 1.5)
-    # at 14 mph, sitting only a mid-ramp offset under the lead is no longer enough
+    # at 15.5 mph, sitting only a mid-ramp offset under the lead is no longer enough
     self.go.reset()
     v = GO.RAMP_END_V
     des = GO.desired_follow_gap(v, self.p)
@@ -386,7 +412,7 @@ class TestGapOpen(unittest.TestCase):
     gaps = [GO.SHORT_FRAC * des + i * 0.1 for i in range(int((des - GO.SHORT_FRAC * des) / 0.1) + 1)]
     scales = [GO.gap_short_scale(g, des) for g in gaps]
     self.assertTrue(all(scales[i] >= scales[i + 1] - 1e-12 for i in range(len(scales) - 1)))
-    # combined with the speed ramp: at 14 mph, 100% of target -> 0 offset
+    # combined with the speed ramp: at 15.5 mph, 100% of target -> 0 offset
     self.assertAlmostEqual(GO.v_open_offset(v, des, des), 0.0, places=6)
     self.assertAlmostEqual(GO.v_open_offset(v, 0.5 * des, des), GO.V_OPEN, places=6)
     # below ramp start, still 0 even if the gap is short

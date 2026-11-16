@@ -2,14 +2,16 @@
 
 Trigger: only right after both cars stop: ego at a standstill behind a STOPPED
 radar lead (radar-measured, no vision). The car then locks onto that radar
-track. While ego is at or below FULL_V (5 mph) the lock HOLDS the stopped gap
+track. While ego is at or below FULL_V (10 mph) the lock HOLDS the stopped gap
 (where we stopped, or the stop target if smaller) with the radar lead's speed
 (K_VEL) and accel as feed-forward plus a gap correction (K_GAP); the accel
 feed-forward is low-pass filtered (A_LEAD_TAU) so radar aLeadK noise does not
 cause jerks (Matt's decision: gap holding, not pure accel mirroring); positive accel capped at A_POS_MAX (the
-Aggressive launch max). From FULL_V to END_V (6.5 mph) it blends (C1
-smoothstep) back to the normal planner; above END_V the lock is released until
-the next standstill. Hard overrides that always apply:
+Aggressive launch max). From FULL_V to END_V (11.5 mph) it blends (C1
+smoothstep) back to the normal planner; above END_V the follow-lock (gap holding / feed-forward) is
+released, but the safety caps stay until the next standstill or the
+radar lead is lost, so the planner cannot punch to close a residual
+gap and overshoot the lead. Hard overrides that always apply:
 
   * min(lock, normal plan) when the gap is under the stopped-gap floor minus
     GAP_MARGIN, TTC under TTC_MIN, FCW, the lead brakes harder than A_HARD,
@@ -36,8 +38,8 @@ from __future__ import annotations
 import math
 
 ENABLED = True
-FULL_V = 5.0 * 0.44704      # m/s: full lock up to here (Matt: "until ego reaches 5 mph")
-END_V = 6.5 * 0.44704       # m/s: planner only from here (lock released until the next standstill)
+FULL_V = 10.0 * 0.44704     # m/s: full lock up to here (Matt: stay locked until 10 mph)
+END_V = 11.5 * 0.44704      # m/s: planner only from here (smooth handoff just above 10)
 ARM_V = 0.05                # m/s: lock on only from a standstill
 LEAD_STOPPED_V = 0.3        # m/s: the lead must be stopped when we lock on
 LOCK_D_MAX = 25.0           # m
@@ -88,6 +90,7 @@ class LeadLock:
     self.a_f = None
     self.active = False
     self.weight = 0.0
+    self.protect = False
 
   def _unlock(self):
     self.locked = False
@@ -95,6 +98,10 @@ class LeadLock:
     self.prev_d = None
     self.active = False
     self.weight = 0.0
+    self.protect = False
+    self.a_f = None
+    self.d_anchor = None
+    self.d_ref = None
 
   def update(self, lead, v_ego: float, standstill: bool, fcw: bool, a_target: float, a_plan_radar: float,
              launch_active: bool = False, dt: float = 0.05,
@@ -130,13 +137,22 @@ class LeadLock:
         self.d_anchor = d  # gap at lock-on: the floor for every roll-stop cycle of this lock (no inching)
         self.prev_d = d
         self.a_f = None
-      else:
+        self.protect = True
+      elif not self.protect:
         return False, a_target
-    # unlock: other track, cut-in jump, past the lock speed
+      elif not (0.0 < d < LOCK_D_MAX) or tid != self.track_id:
+        self._unlock()
+        return False, a_target
+    # unlock fully: other track or cut-in jump. Past END_V we only release the
+    # follow-lock (weight = 0); safety caps stay in protect mode.
     if (self.track_id is not None and tid != self.track_id) or \
-       (self.prev_d is not None and d < self.prev_d - CUTIN_DROP_M) or v_ego >= END_V:
+       (self.prev_d is not None and d < self.prev_d - CUTIN_DROP_M):
       self._unlock()
       return False, a_target
+    if v_ego >= END_V:
+      self.locked = False
+      self.active = False
+      self.weight = 0.0
     self.prev_d = d
     if stopped and abs(v_lead) < LEAD_STOPPED_V:
       self.d_ref = d  # still both stopped: this is the gap to hold
@@ -173,16 +189,17 @@ class LeadLock:
       a_m = min(a_m, max((v_lead - v_ego) / t_match, 0.0))
     # always able to stop at the stopped gap if the lead brakes now: speed no higher than v_safe, where
     # room = v^2/(2*SAFE_DECEL) + v*SAFE_LAG, room = gap + lead's stop distance (at LEAD_STOP_DECEL) - floor
+    lead_stop_now = max(v_lead, 0.0) ** 2 / (2.0 * SAFE_LEAD_DECEL)
+    room_now = d + lead_stop_now - (floor_gap + SAFE_MARGIN)
+    v_safe = 0.0
+    if room_now > 0.0:
+      b = SAFE_DECEL
+      v_safe = b * (-SAFE_LAG + math.sqrt(SAFE_LAG * SAFE_LAG + 2.0 * room_now / b))
     if a_m > 0.0:
-      lead_stop_now = max(v_lead, 0.0) ** 2 / (2.0 * SAFE_LEAD_DECEL)
-      room_now = d + lead_stop_now - (floor_gap + SAFE_MARGIN)
-      v_safe = 0.0
-      if room_now > 0.0:
-        b = SAFE_DECEL
-        v_safe = b * (-SAFE_LAG + math.sqrt(SAFE_LAG * SAFE_LAG + 2.0 * room_now / b))
       a_m = min(a_m, max((v_safe - v_ego) / t_match, 0.0))
     # no inching: brake at least enough to stop at the stopped gap behind where the lead will stop
     # (lead's stopping distance from its measured decel, or here if it is stopped / not decelerating)
+    a_req = None
     if self.a_f < -0.1 or v_lead < v_ego:  # filtered: radar noise must not toggle this brake on/off
       # conservative: the lead may stop at LEAD_STOP_DECEL even if radar still reports a softer decel
       # (aLeadK lags), and our actuators react ~ACT_LAG late
@@ -190,8 +207,18 @@ class LeadLock:
       room = d + lead_stop - (floor_gap + STOP_MARGIN) - v_ego * ACT_LAG
       a_req = -(v_ego * v_ego) / (2.0 * max(room, 0.05))
       a_m = min(a_m, a_req)
-    w = _w(v_ego)
+    w = _w(v_ego) if self.locked else 0.0
     a_out = w * a_m + (1.0 - w) * float(a_target)
+    # After blending (and after the follow-lock hands off at END_V), keep the
+    # speed-match cap so the planner cannot punch above the lead to close a
+    # residual gap. The always-can-stop / no-inching / hard overrides still
+    # apply as min() as well: they cannot raise accel.
+    if a_out > 0.0:
+      a_out = min(a_out, max((v_lead - v_ego) / t_match, 0.0))
+    if d < floor_gap - GAP_MARGIN or ttc < TTC_MIN or fcw or a_lead < A_HARD or v_lead < V_BACK or lead_stopped:
+      a_out = min(a_out, float(a_plan_radar))
+    if a_req is not None:
+      a_out = min(a_out, a_req)
     a_out = min(max(a_out, A_MIN), A_MAX)
     self.active = w > 0.0
     self.weight = w
