@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc as LM
+from openpilot.sunnypilot.selfdrive.controls.lib import lite_gap_open as GO
 from openpilot.sunnypilot.selfdrive.controls.lib import lite_lead_lock as LK
 from openpilot.sunnypilot.selfdrive.controls.lib import lite_turn_cap as TC
 
@@ -222,7 +223,192 @@ class TestTurnCap(unittest.TestCase):
     src = (PKG / "selfdrive/controls/lib/longitudinal_planner.py").read_text()
     i = src.index("output_a_target = turn_cap_accel(")
     self.assertGreater(i, src.index("self.lead_lock.update("))
+    self.assertGreater(i, src.index("self.gap_open.update("))
+    self.assertGreater(src.index("self.gap_open.update("), src.index("self.lead_lock.update("))
     self.assertGreater(src.index("self.output_a_target = np.clip(output_a_target"), i)
+
+
+class TestGapOpen(unittest.TestCase):
+  """Post-launch soft accel cap: open a short follow gap a little faster, comfortably."""
+
+  def setUp(self):
+    self.go = GO.LiteGapOpen()
+    self.p = LM.log.LongitudinalPersonality.aggressive if hasattr(LM, "log") else None
+    from openpilot.cereal import log
+    self.p = log.LongitudinalPersonality.aggressive
+    self.std = log.LongitudinalPersonality.standard
+    self.rel = log.LongitudinalPersonality.relaxed
+
+  def step(self, ld, v_ego=8.0, standstill=False, fcw=False, a_t=1.0, a_prev=1.0, dt=DT,
+           lock=False, boost=False, personality=None):
+    return self.go.update(ld, v_ego, standstill, fcw, personality or self.p, a_t, a_prev, dt,
+                          lock_active=lock, boost_active=boost)
+
+  def arm_and_roll(self, t=1.2, v0=0.0, v1=8.0, d=14.0, v_lead=9.0, a_lead=0.0, a_t=1.0):
+    """Standstill arm, then roll past 0.9 s and 6.5 mph so the cap may apply."""
+    self.step(rl(d=9.05), v_ego=0.0, standstill=True, a_t=-0.5, a_prev=-0.5)
+    n = max(int(round(t / DT)), 1)
+    a = a_t
+    on = False
+    for i in range(n):
+      frac = (i + 1) / n
+      v = v0 + (v1 - v0) * frac
+      on, a = self.step(rl(d=d, v=v_lead, a=a_lead), v_ego=v, a_t=a_t, a_prev=a)
+    return on, a
+
+  def test_follow_times_unchanged(self):
+    from openpilot.cereal import log
+    self.assertAlmostEqual(LM.get_T_FOLLOW(log.LongitudinalPersonality.aggressive), 1.25)
+    self.assertAlmostEqual(LM.get_T_FOLLOW(log.LongitudinalPersonality.standard), 1.45)
+    self.assertAlmostEqual(LM.get_T_FOLLOW(log.LongitudinalPersonality.relaxed), 1.75)
+
+  def test_desired_gap_is_t_follow_v_plus_stop(self):
+    from openpilot.cereal import log
+    v = 20 * MPH
+    for pers, T in ((log.LongitudinalPersonality.aggressive, 1.25),
+                    (log.LongitudinalPersonality.standard, 1.45),
+                    (log.LongitudinalPersonality.relaxed, 1.75)):
+      self.assertAlmostEqual(GO.desired_follow_gap(v, pers), T * v + LM.STOP_DISTANCE)
+
+  def test_inactive_at_standstill_and_first_motion(self):
+    on, a = self.step(rl(d=9.05), v_ego=0.0, standstill=True, a_t=-0.5, a_prev=-0.5)
+    self.assertFalse(on); self.assertEqual(a, -0.5)
+    # 0.5 s later, still below lock end and MIN_MOTION_S: unchanged
+    on, a = self.step(rl(d=10.0, v=3.0, a=1.0), v_ego=1.0, a_t=1.5, a_prev=-0.5)
+    self.assertFalse(on); self.assertEqual(a, 1.5)
+    # 0.8 s total, past 6.5 mph would still be too early (MIN_MOTION_S=0.9)
+    for _ in range(6):
+      on, a = self.step(rl(d=12.0, v=8.0, a=0.5), v_ego=8.0, a_t=1.5, a_prev=1.5)
+    self.assertFalse(on); self.assertEqual(a, 1.5)
+
+  def test_inactive_while_lock_or_boost_active(self):
+    self.step(rl(d=9.05), v_ego=0.0, standstill=True, a_t=-0.5, a_prev=-0.5)
+    for _ in range(int(1.2 / DT)):
+      on, a = self.step(rl(d=12.0, v=8.0, a=0.5), v_ego=8.0, a_t=1.5, a_prev=1.5, lock=True)
+    self.assertFalse(on); self.assertEqual(a, 1.5)
+    self.go.reset()
+    self.step(rl(d=9.05), v_ego=0.0, standstill=True, a_t=-0.5, a_prev=-0.5)
+    for _ in range(int(1.2 / DT)):
+      on, a = self.step(rl(d=12.0, v=8.0, a=0.5), v_ego=8.0, a_t=1.5, a_prev=1.5, boost=True)
+    self.assertFalse(on); self.assertEqual(a, 1.5)
+
+  def test_inactive_below_lock_end_speed(self):
+    self.step(rl(d=9.05), v_ego=0.0, standstill=True, a_t=-0.5, a_prev=-0.5)
+    v = GO.LOCK_END_V - 0.05
+    for _ in range(int(1.2 / DT)):
+      on, a = self.step(rl(d=10.0, v=v + 1.0, a=0.5), v_ego=v, a_t=1.5, a_prev=1.5)
+    self.assertFalse(on); self.assertEqual(a, 1.5)
+
+  def test_caps_when_gap_short_and_closing(self):
+    # 20 mph, Aggressive target ~ T*v+6 ≈ 17.2 m; gap 13 m; ego matching lead speed
+    v = 20 * MPH
+    des = GO.desired_follow_gap(v, self.p)
+    self.assertGreater(des, 16.0)
+    on, a = self.arm_and_roll(t=1.5, v1=v, d=13.0, v_lead=v, a_lead=0.0, a_t=1.2)
+    self.assertTrue(on)
+    self.assertLess(a, 1.2)
+    self.assertGreaterEqual(a, GO.A_FLOOR - 1e-9)
+
+  def test_never_below_floor_and_never_raises(self):
+    v = 20 * MPH
+    on, a = self.arm_and_roll(t=2.0, v1=v, d=10.0, v_lead=v - 1.0, a_lead=0.0, a_t=1.5)
+    # ego faster than lead, short gap: cap applies, not below floor
+    self.assertTrue(on)
+    self.assertGreaterEqual(a, GO.A_FLOOR - 1e-9)
+    self.assertLessEqual(a, 1.5)
+    # incoming plan already braking harder: pass through (never weaken)
+    on, a = self.step(rl(d=10.0, v=v - 1.0, a=0.0), v_ego=v, a_t=-1.5, a_prev=-1.5)
+    self.assertFalse(on)
+    self.assertEqual(a, -1.5)
+
+  def test_no_cap_when_already_opening_or_at_target(self):
+    v = 20 * MPH
+    des = GO.desired_follow_gap(v, self.p)
+    # gap already at the target, ego matching lead: no cap
+    on, a = self.arm_and_roll(t=1.5, v1=v, d=des + 0.5, v_lead=v, a_lead=0.0, a_t=1.2)
+    self.assertFalse(on); self.assertEqual(a, 1.2)
+    # short gap but already sitting V_OPEN under the lead: no cap (don't hold back)
+    self.go.reset()
+    on, a = self.arm_and_roll(t=1.5, v1=v, d=0.8 * des, v_lead=v + GO.V_OPEN + 0.5, a_lead=0.2, a_t=1.2)
+    self.assertFalse(on); self.assertEqual(a, 1.2)
+
+  def test_no_cap_when_lead_brakes_or_fcw(self):
+    v = 20 * MPH
+    self.arm_and_roll(t=1.5, v1=v, d=13.0, v_lead=v, a_lead=0.0, a_t=1.2)
+    on, a = self.step(rl(d=13.0, v=v, a=-0.8), v_ego=v, a_t=0.4, a_prev=0.4)
+    self.assertFalse(on); self.assertEqual(a, 0.4)
+    on, a = self.step(rl(d=13.0, v=v, a=0.0), v_ego=v, fcw=True, a_t=0.4, a_prev=0.4)
+    self.assertFalse(on); self.assertEqual(a, 0.4)
+
+  def test_expires_at_end_speed_and_episode_time(self):
+    v = GO.END_V + 0.05
+    on, a = self.arm_and_roll(t=1.5, v1=v, d=12.0, v_lead=v, a_lead=0.0, a_t=1.0)
+    self.assertFalse(on); self.assertEqual(a, 1.0)
+    self.go.reset()
+    self.step(rl(d=9.05), v_ego=0.0, standstill=True, a_t=-0.5, a_prev=-0.5)
+    # run past MAX_EPISODE_S at a speed where the cap would otherwise apply
+    ev = 20 * MPH
+    steps = int((GO.MAX_EPISODE_S + 0.5) / DT)
+    last = (False, 1.2)
+    for i in range(steps):
+      last = self.step(rl(d=12.0, v=ev, a=0.0), v_ego=ev, a_t=1.2, a_prev=1.2)
+    self.assertFalse(last[0]); self.assertEqual(last[1], 1.2)
+
+  def test_jerk_limited(self):
+    v = 20 * MPH
+    self.step(rl(d=9.05), v_ego=0.0, standstill=True, a_t=-0.5, a_prev=-0.5)
+    a_prev = 1.5
+    lows = []
+    for i in range(int(1.5 / DT)):
+      on, a = self.step(rl(d=12.0, v=v - 0.5, a=0.0), v_ego=v, a_t=1.5, a_prev=a_prev)
+      if on:
+        lows.append(a_prev - a)
+        a_prev = a
+    self.assertTrue(lows)
+    self.assertLessEqual(max(lows), GO.JERK_DOWN * DT + 1e-9)
+
+  def test_not_armed_without_standstill(self):
+    # already moving: must not start an episode (steady follow unchanged)
+    v = 25 * MPH
+    des = GO.desired_follow_gap(v, self.p)
+    on, a = self.step(rl(d=0.7 * des, v=v, a=0.0), v_ego=v, a_t=1.0, a_prev=1.0)
+    self.assertFalse(on); self.assertEqual(a, 1.0)
+    for _ in range(int(2.0 / DT)):
+      on, a = self.step(rl(d=0.7 * des, v=v, a=0.0), v_ego=v, a_t=1.0, a_prev=1.0)
+    self.assertFalse(on); self.assertEqual(a, 1.0)
+
+  def test_disabled(self):
+    GO.ENABLED = False
+    try:
+      on, a = self.arm_and_roll(t=1.5, v1=20 * MPH, d=12.0, v_lead=20 * MPH, a_t=1.2)
+      self.assertFalse(on); self.assertEqual(a, 1.2)
+    finally:
+      GO.ENABLED = True
+
+  def test_fuzz(self):
+    r = np.random.default_rng(21)
+    from openpilot.cereal import log
+    personalities = (log.LongitudinalPersonality.aggressive, log.LongitudinalPersonality.standard,
+                     log.LongitudinalPersonality.relaxed)
+    for _ in range(20000):
+      if r.random() < 0.03:
+        self.go.reset()
+      vals = [r.normal(12, 8), r.normal(0, 4), float("nan"), float("inf")]
+      ld = rl(d=float(r.choice(vals)) if r.random() < 0.05 else float(r.uniform(0, 40)),
+              v=float(r.uniform(-1, 30)), a=float(r.uniform(-5, 3)), present=bool(r.random() < 0.95))
+      v = float(r.uniform(0, 20)); a_t = float(r.uniform(-3.5, 2)); a_p = float(r.uniform(-3.5, 2))
+      on, a = self.step(ld, v_ego=v, standstill=v < 0.01, fcw=bool(r.random() < 0.05),
+                        a_t=a_t, a_prev=a_p, lock=bool(r.random() < 0.2), boost=bool(r.random() < 0.2),
+                        personality=personalities[int(r.integers(0, 3))])
+      self.assertTrue(math.isfinite(a))
+      self.assertLessEqual(a, a_t + 1e-9)  # never raises the plan
+      if not on:
+        self.assertEqual(a, a_t)
+      else:
+        # when we cap, we never go below the floor unless the plan already did
+        self.assertGreaterEqual(a, min(a_t, GO.A_FLOOR) - 1e-9)
+        self.assertLess(a, a_t)  # actually capped
+
 
 
 if __name__ == "__main__":

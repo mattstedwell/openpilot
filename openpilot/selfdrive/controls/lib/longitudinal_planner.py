@@ -23,6 +23,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.lite_e2e_stop import E2eStopSta
 from openpilot.sunnypilot.selfdrive.controls.lib.lite_lead_holdover import LeadHoldover
 from openpilot.sunnypilot.selfdrive.controls.lib.lite_launch_boost import LiteLaunchBoost
 from openpilot.sunnypilot.selfdrive.controls.lib.lite_lead_lock import LeadLock
+from openpilot.sunnypilot.selfdrive.controls.lib.lite_gap_open import LiteGapOpen
 from openpilot.sunnypilot.selfdrive.controls.lib.lite_turn_cap import cap_accel as turn_cap_accel, curvature_from_angle
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
@@ -51,6 +52,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.launch_boost = LiteLaunchBoost()
     self.e2e_stop_state = E2eStopState()
     self.lead_lock = LeadLock()
+    self.gap_open = LiteGapOpen()
     self.vm = None  # VehicleModel for the turn felt-g cap (lazy)
     self.lead_holdover = LeadHoldover()
 
@@ -158,6 +160,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.launch_boost.reset()
       self.e2e_stop_state.reset()
       self.lead_lock.reset()
+      self.gap_open.reset()
     # sunnypilot-lite-test-fix: radar-only launch. The model's e2e stop no longer
     # holds the launch unless it is a stop the lead does not explain (line /
     # sign / light, lite_fusion.model_stop_blocks); the "plan not braking" gate
@@ -189,6 +192,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                                                      dt=self.dt, stop_target=lite_stop_target())
     if lock_on and output_a_target > 0.0:
       self.output_should_stop = False
+    # after a standstill launch, once lock/boost have handed off, softly ease off if the
+    # gap is still below the follow distance (gas only; never weakens braking). Turn cap stays last.
+    _, output_a_target = self.gap_open.update(sm['radarState'].leadOne, v_ego, sm['carState'].standstill, self.fcw,
+                                              sm['selfdriveState'].personality, output_a_target, a_prev, self.dt,
+                                              lock_active=bool(lock_on), boost_active=bool(boost_on))
     # no hard accel into low-speed intersection turns (steering angle + lat accel), after every launch path
     output_a_target = turn_cap_accel(output_a_target, v_ego, self.turn_curvature(sm['carState']),
                                      sm['carState'].steeringAngleDeg, sm['carState'].steeringRateDeg)

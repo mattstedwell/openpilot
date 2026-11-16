@@ -96,6 +96,15 @@ except Exception:
   TC = None
 if TC is not None:
   TC.ENABLED = bool(CAND.get("turncap", False))
+try:
+  from openpilot.sunnypilot.selfdrive.controls.lib import lite_gap_open as GO
+except Exception:
+  GO = None
+USE_GAPOPEN = bool(CAND.get("gapopen", False) and GO is not None)
+if GO is not None:
+  GO.ENABLED = USE_GAPOPEN
+  for _k, _v in CAND.get("go", {}).items():
+    setattr(GO, _k, _v)
 if LK is not None:
   LK.ENABLED = USE_LOCK
   for _k, _v in CAND.get("lk", {}).items():
@@ -124,6 +133,7 @@ LongCtrlState = car.CarControl.Actuators.LongControlState
 CTRL_T = ModelConstants.T_IDXS[:CONTROL_N]
 ACCEL_MIN, ACCEL_MAX = -3.5, 2.0
 MPH = 0.44704
+LOGROWS = []
 
 
 def stop_target():
@@ -484,7 +494,8 @@ def run(personality, sc):
   launch = LL.LiteLaunch() if USE_LAUNCH else None
   boost = LB.LiteLaunchBoost() if USE_BOOST else None
   lock = LK.LeadLock() if (USE_LOCK and LK is not None) else None
-  lock_on = 0; ego_a_onset = None; a_at = {}; gap_at = {}; turn_peak_a = 0.0; turn_peak_ea = 0.0; turn_g = {}
+  gapopen = GO.LiteGapOpen() if (USE_GAPOPEN and GO is not None) else None
+  lock_on = 0; gapopen_on = 0; ego_a_onset = None; a_at = {}; gap_at = {}; turn_peak_a = 0.0; turn_peak_ea = 0.0; turn_g = {}
   model = ModelEmu(sc["model"], sc["v_cruise"]) if USE_E2E else None
   use_fusion = bool(CAND.get("fusion", True))
   vis_hist = []
@@ -655,12 +666,27 @@ def run(personality, sc):
         lock_on += int(lk_on)
         if lk_on and a_t > 0.0:
           ss = False
+      if gapopen is not None:
+        go_on, a_t = gapopen.update(rs.leadOne, ev, standstill, fcw, personality, a_t, a_prev, 0.05,
+                                    lock_active=bool(lock is not None and lock.active),
+                                    boost_active=bool(boost is not None and boost.active))
+        gapopen_on += int(go_on)
       if TC is not None and sc.get("steer"):
         ang, rate = steer_at(sc, t)
         a_t = float(TC.cap_accel(a_t, ev, TC.curvature_from_angle(ang), ang, rate))
         if abs(ang) > 30.0:
           turn_peak_a = max(turn_peak_a, a_t)
       out_a = a_t; plan_a = a_t
+      if os.environ.get("SIM_LOGROWS"):
+        LOGROWS.append(dict(t=round(t, 2), ev=ev, lv=lv, gap=gap, ea=ea,
+                            a_mpc=float(a_mpc), a_cr=float(a_cruise),
+                            a_e2e=(float(a_e2e) if a_e2e is not None else None),
+                            a_out=float(a_t), quick=bool(quick),
+                            boost=bool(boost.active) if boost is not None else False,
+                            bfloor=float(boost.floor) if boost is not None else 0.0,
+                            lockw=float(lock.weight) if lock is not None else 0.0,
+                            locked=bool(lock.locked) if lock is not None else False,
+                            gapopen=bool(gapopen.active) if gapopen is not None else False))
       vdf.x = vdf.x + 0.05 * (out_a + a_prev) / 2.0
     CS = SimpleNamespace(vEgo=ev, aEgo=ea, brakePressed=False, standstill=ev < 1e-3,
                          cruiseState=SimpleNamespace(standstill=False))
@@ -767,7 +793,7 @@ def run(personality, sc):
               t_5mph=tv.get(5), t_10mph=tv.get(10), t_20mph=tv.get(20), t_move_ref=t_move_ref,
               t_clear=None if t_clear is None or t_ref is None else round(t_clear - t_ref, 2), t_move_after_clear=t_move_clear,
               still_disp_m=round(still_disp, 3) if sc["still"] is not None else None, stop_comfort=stop_comfort,
-              boost_cycles=boost_on, lock_cycles=lock_on, t_ego_accel_onset=ego_a_onset,
+              boost_cycles=boost_on, lock_cycles=lock_on, gapopen_cycles=gapopen_on, t_ego_accel_onset=ego_a_onset,
               a_at_0_5=a_at.get(0.5), a_at_1_0=a_at.get(1.0), a_at_2_0=a_at.get(2.0),
               gap_at_3=gap_at.get(3.0), gap_at_5=gap_at.get(5.0),
               turn_peak_plan_a=round(turn_peak_a, 3) if sc.get("steer") else None,
