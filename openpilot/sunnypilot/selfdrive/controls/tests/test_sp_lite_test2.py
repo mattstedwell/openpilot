@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from cereal import log
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc as LM
 from openpilot.sunnypilot.selfdrive.controls.lib import lite_lead_lock as LK
 from openpilot.sunnypilot.selfdrive.controls.lib import lite_turn_cap as TC
@@ -38,6 +37,7 @@ class TestStoppedGapUnchanged(unittest.TestCase):
   def test_file_identical_to_4ba9(self):
     try:
       out = subprocess.run(["git", "-C", str(TREE), "diff", "--stat", "4ba9a6967a", "--",
+                            "openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py",
                             "openpilot/sunnypilot/selfdrive/controls/lib/lite_e2e_stop.py",
                             "openpilot/selfdrive/controls/lib/longcontrol.py",
                             "openpilot/selfdrive/controls/controlsd.py"], capture_output=True, text=True, timeout=60)
@@ -46,26 +46,6 @@ class TestStoppedGapUnchanged(unittest.TestCase):
     if out.returncode != 0:
       self.skipTest(out.stderr)
     self.assertEqual(out.stdout.strip(), "")  # stopped gap, light/sign stop, soft final stop, controlsd untouched
-
-  def test_long_mpc_only_follow_times_changed(self):
-    # Nov 15 2026 (Matt): every follow time +0.25 s; nothing else in long_mpc.py may differ from 4ba9a6967a.
-    P = log.LongitudinalPersonality
-    self.assertAlmostEqual(LM.get_T_FOLLOW(P.aggressive), 1.50)
-    self.assertAlmostEqual(LM.get_T_FOLLOW(P.standard), 1.70)
-    self.assertAlmostEqual(LM.get_T_FOLLOW(P.relaxed), 2.00)
-    try:
-      out = subprocess.run(["git", "-C", str(TREE), "diff", "-U0", "4ba9a6967a", "--",
-                            "openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py"],
-                           capture_output=True, text=True, timeout=60)
-    except Exception as e:  # pragma: no cover
-      self.skipTest(f"git unavailable: {e}")
-    if out.returncode != 0:
-      self.skipTest(out.stderr)
-    changed = [l for l in out.stdout.splitlines()
-               if l[:1] in "+-" and not l.startswith(("+++", "---"))]
-    self.assertEqual(sorted(changed), sorted([
-      "-    return 1.75", "-    return 1.45", "-    return 1.25",
-      "+    return 2.00", "+    return 1.70", "+    return 1.50"]))
 
 
 class TestLeadLock(unittest.TestCase):
