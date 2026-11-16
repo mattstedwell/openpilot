@@ -38,9 +38,16 @@ STOP_REST_V = 0.02         # m/s: at rest (or CS.standstill)
 
 
 def long_control_state_trans(CP_SP, active, long_control_state,
-                             should_stop, brake_pressed, cruise_standstill):
-  # Gas Interceptor
-  cruise_standstill = cruise_standstill and not CP_SP.enableGasInterceptor
+                             should_stop, brake_pressed, cruise_standstill,
+                             auto_resume_sng: bool = False):
+  # Gas Interceptor, or a car that can auto-resume from a stop (Toyota TSS2 /
+  # NO_STOP_TIMER, including Matt's Highlander Hybrid). If we keep treating the
+  # PCM's cruise-standstill flag as a hard block, longcontrol stays in Stopping
+  # and never sends the positive accel that would release the PCM — the driver
+  # then has to tap the gas, even though openpilot stayed engaged and the
+  # planner already wanted to go (road report: lead inched, then pulled away).
+  cruise_standstill = (cruise_standstill and not CP_SP.enableGasInterceptor
+                       and not auto_resume_sng)
 
   starting_condition = (not should_stop and
                         not cruise_standstill and
@@ -88,7 +95,8 @@ class LongControl:
     prev_state = self.long_control_state
     self.long_control_state = long_control_state_trans(self.CP_SP, active, self.long_control_state,
                                                        should_stop, CS.brakePressed,
-                                                       CS.cruiseState.standstill)
+                                                       CS.cruiseState.standstill,
+                                                       auto_resume_sng=bool(getattr(self.CP, "autoResumeSng", False)))
     self.v_peak = 0.0 if CS.standstill else max(self.v_peak, float(CS.vEgo))
     if self.long_control_state != LongCtrlState.stopping:
       self.stop_soft = False

@@ -40,13 +40,20 @@ class TestStoppedGapUnchanged(unittest.TestCase):
       out = subprocess.run(["git", "-C", str(TREE), "diff", "--stat", "4ba9a6967a", "--",
                             "openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py",
                             "openpilot/sunnypilot/selfdrive/controls/lib/lite_e2e_stop.py",
-                            "openpilot/selfdrive/controls/lib/longcontrol.py",
                             "openpilot/selfdrive/controls/controlsd.py"], capture_output=True, text=True, timeout=60)
     except Exception as e:  # pragma: no cover
       self.skipTest(f"git unavailable: {e}")
     if out.returncode != 0:
       self.skipTest(out.stderr)
-    self.assertEqual(out.stdout.strip(), "")  # stopped gap, light/sign stop, soft final stop, controlsd untouched
+    self.assertEqual(out.stdout.strip(), "")  # stopped gap, light/sign stop, controlsd untouched
+    # longcontrol.py is intentionally not bit-identical: autoResumeSng lets TSS2
+    # cars leave Stopping when the planner wants to go (PCM standstill hold).
+    # The soft-final-stop path (Stopping ramp toward stopAccel) is unchanged;
+    # should_stop and brake_pressed still block starting.
+    src = (TREE / "openpilot/selfdrive/controls/lib/longcontrol.py").read_text()
+    self.assertIn("self.CP.stopAccel", src)  # standstill hold still ramps toward stopAccel
+    self.assertIn("STOP_SMOOTH", src)        # soft final stop still present
+    self.assertIn("not should_stop", src)
 
 
 class TestLeadLock(unittest.TestCase):
