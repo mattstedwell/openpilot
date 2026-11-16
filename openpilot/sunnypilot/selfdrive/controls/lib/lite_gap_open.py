@@ -7,13 +7,14 @@ overshoots the lead's speed when the lead finishes accelerating.
 A later request (same day) raised the ease-off from about 1 mph under the lead
 to about 2 mph (V_OPEN = 2.0 * MPH). The accel floor stays -0.3 m/s^2.
 
-A follow-up the same day: start opening the gap during the launch, so that by
-the time ego reaches 6.5 mph it is already targeting about 2 mph under the
-lead. The under-lead offset ramps with a C2 smootherstep from 0 at
-RAMP_START_V (2.5 mph) to the full V_OPEN at LOCK_END_V (6.5 mph). The first
-2.5 mph of the launch, including t_move, are not capped. The previous hard
-gates (wait for lead-lock handoff at 6.5 mph, plus 0.9 s of motion) are
-replaced by this speed ramp.
+A follow-up requested a ramp-in during the launch (originally 2.5 to 6.5 mph).
+Matt then asked to leave the launch alone until 10 mph: below 10 mph the
+module behaves exactly like no gap-open (normal launch, lead lock, and
+boost). The ease-off episode is not started, and the cap is not applied,
+until ego reaches RAMP_START_V (10 mph). From there the under-lead offset
+ramps with a C2 smootherstep to the full V_OPEN at RAMP_END_V (14 mph).
+Standstill behind a lead still marks the car eligible, so a later 10 mph
+crossing can start the episode; eligibility alone does not change accel.
 
 The offset itself is also proportional to how short the gap is, so it stays
 human-like: up to ~2 mph under the lead when the gap is well short of the
@@ -21,8 +22,14 @@ personality follow distance (at or below SHORT_FRAC of T_FOLLOW*v +
 STOP_DISTANCE), shrinking with a C2 smootherstep to 0 as the gap approaches
 100% of that target. The cap turns off exactly at 100% (no lingering under
 the lead) but the launch episode stays armed, so a later sag can ease off
-again — for example a second pull-away before the 35 mph / 25 s expiry. There is no 80-95% accel fade and no
-fixed 2 mph hold after the gap is closed.
+again — for example a second pull-away before the 35 mph / 25 s expiry.
+
+The ease-off itself is kept gentle: the cap's own decel is limited to
+A_SOFT (about -0.10 m/s^2), well above the hard A_FLOOR of -0.3, so a
+large catch-up error does not slam into the floor. As the gap fills from
+SHORT_FRAC to 100%, that cap is also blended back toward the incoming
+plan with the same C2 smootherstep, so the release is gradual rather than
+an abrupt lift. There is no fixed 2 mph hold after the gap is closed.
 
 The cap is min()'d with the incoming plan, including while launch_boost and
 lead_lock are still active. Those hooks still run first (boost may raise the
@@ -33,12 +40,15 @@ so a stopped or slowing lead is never ignored.
 
 Constraints (all enforced here and in the planner hook):
   * gas ease-off only: the cap is min()'d with the incoming plan, so it never
-    weakens braking. The cap itself is never below A_FLOOR (-0.3 m/s^2).
-  * first RAMP_START_V (~2.5 mph) of the launch is not touched, so take-up
-    and t_move stay with lite_launch / boost / lead_lock.
-  * the episode is only armed from a standstill behind a lead; it expires at
-    END_V (~35 mph) or MAX_EPISODE_S, so steady moving follow is unchanged.
-    Reaching 100% of the target turns the cap off; it does not end the episode.
+    weakens braking. The cap's own command is limited to A_SOFT (~-0.10 m/s^2);
+    A_FLOOR (-0.3 m/s^2) remains only a hard bound.
+  * below RAMP_START_V (10 mph) the launch is not touched, so take-up,
+    t_move, lead lock and the first part of boost stay stock. The ease-off
+    episode is not started before 10 mph.
+  * eligibility is remembered from a standstill behind a lead, but the
+    episode itself starts only at 10 mph; it expires at END_V (~35 mph) or
+    MAX_EPISODE_S, so steady moving follow is unchanged. Reaching 100% of
+    the target turns the cap off; it does not end the episode.
   * a slowing / braking lead, FCW, or a missing lead drops the cap immediately
     (the stock plan is used). The cap never raises accel, so it cannot launch
     into a stopped lead or inch on a roll-stop cycle.
@@ -58,14 +68,15 @@ from openpilot.cereal import log
 ENABLED = True
 MPH = 0.44704
 ARM_V = 0.05                 # m/s: arm only from a standstill
-RAMP_START_V = 2.5 * MPH     # m/s: start blending the under-lead offset in
-LOCK_END_V = 6.5 * MPH       # m/s: full speed-ramp from here (lead lock is released)
+RAMP_START_V = 10.0 * MPH    # m/s: start blending the under-lead offset in
+RAMP_END_V = 14.0 * MPH      # m/s: full speed-ramp from here
 END_V = 35.0 * MPH           # m/s: episode ends (highway / leaving the launch)
-MAX_EPISODE_S = 25.0         # s after first motion
+MAX_EPISODE_S = 25.0         # s after the episode starts (at 10 mph)
 SHORT_FRAC = 0.90            # full V_OPEN at or below this fraction of the target gap
 V_OPEN = 2.0 * MPH           # m/s (~2 mph): max under-lead offset when the gap is well short
 TAU = 1.2                    # s: speed error -> accel
-A_FLOOR = -0.30              # m/s^2: never command more than a light ease-off
+A_SOFT = -0.10               # m/s^2: max ease-off the cap itself may command
+A_FLOOR = -0.30              # m/s^2: hard bound (the cap uses A_SOFT, not this)
 A_LEAD_MIN = -0.30           # m/s^2: lead not braking
 JERK_DOWN = 1.2              # m/s^3: ease-off rate (comfort)
 JERK_UP = 1.0                # m/s^3: release rate
@@ -78,10 +89,10 @@ def _smootherstep01(x: float) -> float:
 
 
 def v_open_scale(v_ego: float) -> float:
-  """0 at or below RAMP_START_V, 1 at or above LOCK_END_V, C2 smootherstep between."""
-  span = LOCK_END_V - RAMP_START_V
+  """0 at or below RAMP_START_V, 1 at or above RAMP_END_V, C2 smootherstep between."""
+  span = RAMP_END_V - RAMP_START_V
   if span <= 1e-6:
-    return 1.0 if float(v_ego) >= LOCK_END_V else 0.0
+    return 1.0 if float(v_ego) >= RAMP_END_V else 0.0
   return _smootherstep01((float(v_ego) - RAMP_START_V) / span)
 
 
@@ -106,7 +117,7 @@ def gap_short_scale(gap: float, desired: float) -> float:
 def v_open_offset(v_ego: float, gap: float | None = None, desired: float | None = None) -> float:
   """Ramped, gap-proportional under-lead offset (m/s).
 
-  Speed ramp: 0 until 2.5 mph, full scale by 6.5 mph. If gap and desired are
+  Speed ramp: 0 until 10 mph, full scale by 14 mph. If gap and desired are
   given, also shrinks to 0 as the gap reaches 100% of the follow target.
   """
   scale = v_open_scale(v_ego)
@@ -148,8 +159,9 @@ class LiteGapOpen:
     else:
       out = min(desired_out, a_prev + JERK_UP * dt)
     out = min(out, a_target)
-    # never ease off harder than the floor unless the incoming plan already is
-    return max(out, min(a_target, A_FLOOR))
+    # the cap itself never eases off harder than A_SOFT; if the plan is already
+    # below that, the early-return has already passed the plan through
+    return max(out, min(a_target, A_SOFT))
 
   def update(self, lead, v_ego: float, standstill: bool, fcw: bool, personality, a_target: float,
              a_prev: float, dt: float, lock_active: bool = False, boost_active: bool = False) -> tuple[bool, float]:
@@ -171,7 +183,9 @@ class LiteGapOpen:
     present = lead is not None and bool(getattr(lead, "present", False))
     self.missing = 0.0 if present else self.missing + dt
 
-    # arm only from a standstill behind a lead; start the episode on first motion
+    # Remember eligibility from a standstill behind a lead, but do not start
+    # the ease-off episode (or apply any cap) before 10 mph. Below that, accel
+    # is exactly the incoming plan (launch / lock / boost are untouched).
     if standstill or v_ego < ARM_V:
       if present:
         self.armed = True
@@ -186,6 +200,11 @@ class LiteGapOpen:
         self.motion_t = 0.0
       return False, a_target
 
+    # still below the 10 mph start: eligible, but the episode has not armed
+    if v_ego < RAMP_START_V:
+      self.applied = a_target
+      return False, a_target
+
     if self.armed and not self.episode:
       self.episode = True
       self.held = False
@@ -198,7 +217,7 @@ class LiteGapOpen:
     if v_ego >= END_V or self.motion_t >= MAX_EPISODE_S or self.missing > MISSING_MAX_S:
       return self._end_episode(a_target)
 
-    # first 2.5 mph are uncapped (keeps t_move / take-up with launch, boost, lock)
+    # below 10 mph is already returned above; v_scale is 0 until RAMP_START_V
     v_scale = v_open_scale(v_ego)
     if v_scale <= 1e-3 or not present or fcw:
       self.applied = a_target
@@ -246,7 +265,10 @@ class LiteGapOpen:
       return False, a_target
 
     a_cap = v_err / TAU
-    a_cap = max(a_cap, A_FLOOR)
+    a_cap = max(a_cap, A_SOFT)
+    # gradual fade-out: blend the cap back toward the incoming plan as the
+    # gap fills from SHORT_FRAC to 100%, so release is smooth, not abrupt
+    a_cap = a_target + g_scale * (a_cap - a_target)
     # never raise the plan (min on top of launch_boost / lead_lock)
     desired_out = min(a_target, a_cap)
     # plan already at or below the cap (including already braking): do not touch it

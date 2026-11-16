@@ -229,7 +229,7 @@ class TestTurnCap(unittest.TestCase):
 
 
 class TestGapOpen(unittest.TestCase):
-  """Post-launch soft accel cap: ramp to ~2 mph under the lead by 6.5 mph."""
+  """Post-launch soft accel cap: ramp to ~2 mph under the lead from 10 to 14 mph."""
 
   def setUp(self):
     self.go = GO.LiteGapOpen()
@@ -245,7 +245,7 @@ class TestGapOpen(unittest.TestCase):
                           lock_active=lock, boost_active=boost)
 
   def arm_and_roll(self, t=1.2, v0=0.0, v1=8.0, d=14.0, v_lead=9.0, a_lead=0.0, a_t=1.0):
-    """Standstill arm, then roll past the 2.5-6.5 mph ramp so the cap may apply."""
+    """Standstill eligibility, then roll past the 10-14 mph ramp so the cap may apply."""
     self.step(rl(d=9.05), v_ego=0.0, standstill=True, a_t=-0.5, a_prev=-0.5)
     n = max(int(round(t / DT)), 1)
     a = a_t
@@ -258,8 +258,10 @@ class TestGapOpen(unittest.TestCase):
 
   def test_v_open_is_about_2_mph(self):
     self.assertAlmostEqual(GO.V_OPEN, 2.0 * MPH, places=3)
-    # floor stays a light ease-off; 2 mph under is a setpoint, not a harder brake
+    # the cap's own ease-off is limited to A_SOFT; A_FLOOR is only a hard bound
+    self.assertAlmostEqual(GO.A_SOFT, -0.10, places=2)
     self.assertAlmostEqual(GO.A_FLOOR, -0.30, places=2)
+    self.assertGreater(GO.A_SOFT, GO.A_FLOOR)
 
   def test_follow_times_unchanged(self):
     from openpilot.cereal import log
@@ -282,9 +284,17 @@ class TestGapOpen(unittest.TestCase):
     v = GO.RAMP_START_V - 0.05
     on, a = self.step(rl(d=10.0, v=3.0, a=1.0), v_ego=v, a_t=1.5, a_prev=-0.5)
     self.assertFalse(on); self.assertEqual(a, 1.5)
+    self.assertFalse(self.go.episode)  # episode must not arm before 10 mph
     for _ in range(int(1.0 / DT)):
       on, a = self.step(rl(d=10.0, v=3.0, a=1.0), v_ego=v, a_t=1.5, a_prev=1.5)
     self.assertFalse(on); self.assertEqual(a, 1.5)
+    self.assertFalse(self.go.episode)
+    # lead-lock handoff speed (6.5 mph) is also still a no-op
+    v_lock = 6.5 * MPH
+    self.assertLess(v_lock, GO.RAMP_START_V)
+    on, a = self.step(rl(d=10.0, v=v_lock + 1.0, a=1.0), v_ego=v_lock, a_t=1.5, a_prev=1.5)
+    self.assertFalse(on); self.assertEqual(a, 1.5)
+    self.assertFalse(self.go.episode)
 
   def test_min_on_top_of_lock_or_boost(self):
     """Cap may apply while lock/boost are still flagged; it only reduces accel."""
@@ -303,32 +313,33 @@ class TestGapOpen(unittest.TestCase):
     on, a = self.step(rl(d=13.0, v=v, a=-0.8), v_ego=v, a_t=0.4, a_prev=0.4, lock=True, boost=True)
     self.assertFalse(on); self.assertEqual(a, 0.4)
 
-  def test_ramp_reaches_full_offset_at_6p5_mph(self):
-    self.assertAlmostEqual(GO.RAMP_START_V, 2.5 * MPH, places=3)
-    self.assertAlmostEqual(GO.LOCK_END_V, 6.5 * MPH, places=3)
+  def test_ramp_reaches_full_offset_at_14_mph(self):
+    self.assertAlmostEqual(GO.RAMP_START_V, 10.0 * MPH, places=3)
+    self.assertAlmostEqual(GO.RAMP_END_V, 14.0 * MPH, places=3)
     self.assertAlmostEqual(GO.v_open_scale(0.0), 0.0, places=6)
     self.assertAlmostEqual(GO.v_open_scale(GO.RAMP_START_V), 0.0, places=6)
     self.assertAlmostEqual(GO.v_open_offset(GO.RAMP_START_V), 0.0, places=6)
-    # just below start: still zero; at 6.5 and above: full 2 mph
+    # just below start: still zero; at 14 and above: full 2 mph
     self.assertAlmostEqual(GO.v_open_scale(GO.RAMP_START_V - 0.05), 0.0, places=6)
-    self.assertAlmostEqual(GO.v_open_scale(GO.LOCK_END_V), 1.0, places=6)
-    self.assertAlmostEqual(GO.v_open_offset(GO.LOCK_END_V), GO.V_OPEN, places=6)
-    self.assertAlmostEqual(GO.v_open_offset(GO.LOCK_END_V + 1.0), GO.V_OPEN, places=6)
+    self.assertAlmostEqual(GO.v_open_scale(6.5 * MPH), 0.0, places=6)
+    self.assertAlmostEqual(GO.v_open_scale(GO.RAMP_END_V), 1.0, places=6)
+    self.assertAlmostEqual(GO.v_open_offset(GO.RAMP_END_V), GO.V_OPEN, places=6)
+    self.assertAlmostEqual(GO.v_open_offset(GO.RAMP_END_V + 1.0), GO.V_OPEN, places=6)
     # midpoint of the speed window is between but not 0.5 (smootherstep is S-shaped)
-    mid = 0.5 * (GO.RAMP_START_V + GO.LOCK_END_V)
+    mid = 0.5 * (GO.RAMP_START_V + GO.RAMP_END_V)
     s_mid = GO.v_open_scale(mid)
     self.assertGreater(s_mid, 0.15)
     self.assertLess(s_mid, 0.85)
     # monotonic and C1-flat at the ends (small step vs mid step)
-    speeds = [GO.RAMP_START_V + i * 0.05 for i in range(int((GO.LOCK_END_V - GO.RAMP_START_V) / 0.05) + 1)]
+    speeds = [GO.RAMP_START_V + i * 0.05 for i in range(int((GO.RAMP_END_V - GO.RAMP_START_V) / 0.05) + 1)]
     scales = [GO.v_open_scale(v) for v in speeds]
     self.assertTrue(all(scales[i] <= scales[i + 1] + 1e-12 for i in range(len(scales) - 1)))
     self.assertLess(scales[1] - scales[0], scales[len(scales)//2] - scales[len(scales)//2 - 1])
 
   def test_partial_cap_during_ramp_and_full_at_handoff(self):
-    """By 6.5 mph the cap uses the full 2 mph offset; mid-ramp uses a smaller one."""
+    """By 14 mph the cap uses the full 2 mph offset; mid-ramp uses a smaller one."""
     # mid-ramp: ego matching lead, short gap -> cap, but less than full V_OPEN would demand
-    v_mid = 0.5 * (GO.RAMP_START_V + GO.LOCK_END_V)
+    v_mid = 0.5 * (GO.RAMP_START_V + GO.RAMP_END_V)
     des_mid = GO.desired_follow_gap(v_mid, self.p)
     on, a = self.arm_and_roll(t=1.2, v1=v_mid, d=0.7 * des_mid, v_lead=v_mid, a_lead=0.0, a_t=1.5)
     self.assertTrue(on)
@@ -339,9 +350,9 @@ class TestGapOpen(unittest.TestCase):
     mid_off = GO.v_open_offset(v_mid)
     on, a = self.arm_and_roll(t=1.2, v1=v_mid, d=0.7 * des_mid, v_lead=v_mid + mid_off + 0.2, a_lead=0.2, a_t=1.5)
     self.assertFalse(on); self.assertEqual(a, 1.5)
-    # at 6.5 mph, sitting only a mid-ramp offset under the lead is no longer enough
+    # at 14 mph, sitting only a mid-ramp offset under the lead is no longer enough
     self.go.reset()
-    v = GO.LOCK_END_V
+    v = GO.RAMP_END_V
     des = GO.desired_follow_gap(v, self.p)
     on, a = self.arm_and_roll(t=1.5, v1=v, d=0.7 * des, v_lead=v + mid_off, a_lead=0.0, a_t=1.5)
     self.assertTrue(on)
@@ -353,7 +364,7 @@ class TestGapOpen(unittest.TestCase):
 
   def test_offset_shrinks_as_gap_approaches_target(self):
     """Full ~2 mph when well short; 0 at 100% of T_FOLLOW*v + STOP; smooth in between."""
-    v = GO.LOCK_END_V
+    v = GO.RAMP_END_V
     des = 20.0
     self.assertAlmostEqual(GO.SHORT_FRAC, 0.90, places=2)
     self.assertAlmostEqual(GO.gap_short_scale(0.0, des), 1.0, places=6)
@@ -368,7 +379,7 @@ class TestGapOpen(unittest.TestCase):
     gaps = [GO.SHORT_FRAC * des + i * 0.1 for i in range(int((des - GO.SHORT_FRAC * des) / 0.1) + 1)]
     scales = [GO.gap_short_scale(g, des) for g in gaps]
     self.assertTrue(all(scales[i] >= scales[i + 1] - 1e-12 for i in range(len(scales) - 1)))
-    # combined with the speed ramp: at 6.5 mph, 100% of target -> 0 offset
+    # combined with the speed ramp: at 14 mph, 100% of target -> 0 offset
     self.assertAlmostEqual(GO.v_open_offset(v, des, des), 0.0, places=6)
     self.assertAlmostEqual(GO.v_open_offset(v, 0.5 * des, des), GO.V_OPEN, places=6)
     # below ramp start, still 0 even if the gap is short
@@ -432,14 +443,71 @@ class TestGapOpen(unittest.TestCase):
   def test_never_below_floor_and_never_raises(self):
     v = 20 * MPH
     on, a = self.arm_and_roll(t=2.0, v1=v, d=10.0, v_lead=v - 1.0, a_lead=0.0, a_t=1.5)
-    # ego faster than lead, short gap: cap applies, not below floor
+    # ego faster than lead, short gap: cap applies, not below the soft ease-off
     self.assertTrue(on)
-    self.assertGreaterEqual(a, GO.A_FLOOR - 1e-9)
+    self.assertGreaterEqual(a, GO.A_SOFT - 1e-9)
     self.assertLessEqual(a, 1.5)
     # incoming plan already braking harder: pass through (never weaken)
     on, a = self.step(rl(d=10.0, v=v - 1.0, a=0.0), v_ego=v, a_t=-1.5, a_prev=-1.5)
     self.assertFalse(on)
     self.assertEqual(a, -1.5)
+
+  def test_cap_decel_stays_near_soft_bound(self):
+    """A large catch-up error must not slam into A_FLOOR; peak lift stays near A_SOFT."""
+    v = 20 * MPH
+    des = GO.desired_follow_gap(v, self.p)
+    # ego 4 mph faster than the lead, gap well short, plan asking for +1.5
+    on, a = self.arm_and_roll(t=2.5, v1=v, d=0.70 * des, v_lead=v - 4.0 * MPH, a_lead=0.0, a_t=1.5)
+    self.assertTrue(on)
+    # after the jerk ramp-in, settle at the soft ease-off, well above the floor
+    for _ in range(int(1.5 / DT)):
+      on, a = self.step(rl(d=0.70 * des, v=v - 4.0 * MPH, a=0.0), v_ego=v, a_t=1.5, a_prev=a)
+    self.assertTrue(on)
+    self.assertGreaterEqual(a, GO.A_SOFT - 1e-9)
+    self.assertLess(a, 0.0)
+    self.assertGreater(a, GO.A_FLOOR + 0.10)  # must not be using the -0.3 floor
+    self.assertAlmostEqual(a, GO.A_SOFT, places=2)
+
+  def test_smooth_release_as_gap_closes(self):
+    """As the gap walks from SHORT_FRAC to 100%, the cap blends toward the plan
+    monotonically and turns off at the target; no abrupt jump off the floor."""
+    v = 20 * MPH
+    des = GO.desired_follow_gap(v, self.p)
+    on, a = self.arm_and_roll(t=2.0, v1=v, d=GO.SHORT_FRAC * des, v_lead=v, a_lead=0.0, a_t=1.5)
+    self.assertTrue(on)
+    # settle at full short-gap cap
+    for _ in range(int(1.5 / DT)):
+      on, a = self.step(rl(d=GO.SHORT_FRAC * des, v=v, a=0.0), v_ego=v, a_t=1.5, a_prev=a)
+    self.assertTrue(on)
+    a_short = a
+    self.assertGreaterEqual(a_short, GO.A_SOFT - 1e-9)
+    # walk the gap up in small steps; commanded accel must rise toward the plan
+    accels = [a_short]
+    gaps = []
+    n = 20
+    for i in range(1, n + 1):
+      frac = GO.SHORT_FRAC + (1.0 - GO.SHORT_FRAC) * (i / n)
+      d = frac * des
+      on, a = self.step(rl(d=d, v=v, a=0.0), v_ego=v, a_t=1.5, a_prev=accels[-1])
+      accels.append(a)
+      gaps.append(frac)
+    # monotonic: each step is at least as close to the plan as the last
+    for i in range(1, len(accels)):
+      self.assertGreaterEqual(accels[i], accels[i - 1] - 1e-9)
+      self.assertLessEqual(accels[i] - accels[i - 1], GO.JERK_UP * DT + 1e-9)
+    # finish the jerk-limited release at/over the target (may take a few steps)
+    for _ in range(int(3.0 / DT)):
+      on, a = self.step(rl(d=des + 0.05, v=v, a=0.0), v_ego=v, a_t=1.5, a_prev=a)
+      accels.append(a)
+      if not on:
+        break
+    self.assertFalse(on)
+    self.assertEqual(a, 1.5)
+    # mid-window (around 95%) is strictly milder than the well-short cap, and
+    # not a jump all the way to the plan in one sample
+    mid_a = accels[n // 2]
+    self.assertGreater(mid_a, a_short + 0.05)
+    self.assertLess(mid_a, 1.5 - 0.05)
 
   def test_no_cap_when_already_opening_or_at_target(self):
     v = 20 * MPH
@@ -525,7 +593,8 @@ class TestGapOpen(unittest.TestCase):
       if not on:
         self.assertEqual(a, a_t)
       else:
-        # when we cap, we never go below the floor unless the plan already did
+        # when we cap, we never go below A_SOFT unless the plan already did
+        self.assertGreaterEqual(a, min(a_t, GO.A_SOFT) - 1e-9)
         self.assertGreaterEqual(a, min(a_t, GO.A_FLOOR) - 1e-9)
         self.assertLess(a, a_t)  # actually capped
 

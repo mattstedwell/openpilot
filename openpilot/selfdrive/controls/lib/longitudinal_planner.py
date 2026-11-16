@@ -193,10 +193,13 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     if lock_on and output_a_target > 0.0:
       self.output_should_stop = False
     # after a standstill launch, softly ease off under the lead if the gap is still
-    # below the follow distance. The under-lead offset ramps in from 2.5 mph (full by
-    # 6.5), and shrinks smoothly to 0 as the gap reaches 100% of target. Applied as
-    # min() on top of lock/boost (never raises accel, never weakens braking, drops if
-    # the lead slows). Turn cap stays last.
+    # below the follow distance. Below 10 mph this is a no-op (normal launch / lock
+    # / boost). From 10 mph the under-lead offset ramps in (full by 14 mph) and
+    # shrinks smoothly to 0 as the gap reaches 100% of target. The cap's own
+    # ease-off is limited to about -0.10 m/s^2 and is blended back to the plan as
+    # the gap fills, so the release is gradual. Applied as min() on top of
+    # lock/boost (never raises accel, never weakens braking, drops if the lead
+    # slows). Turn cap stays last.
     _, output_a_target = self.gap_open.update(sm['radarState'].leadOne, v_ego, sm['carState'].standstill, self.fcw,
                                               sm['selfdriveState'].personality, output_a_target, a_prev, self.dt,
                                               lock_active=bool(lock_on), boost_active=bool(boost_on))
